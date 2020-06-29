@@ -18,8 +18,6 @@ package cmd
 
 import (
 	"context"
-	"fmt"
-	"sync"
 	"time"
 
 	"github.com/minio/minio/cmd/logger"
@@ -29,7 +27,6 @@ import (
 const (
 	bgHealingUUID = "0000-0000-0000-0000"
 	leaderTick    = time.Hour
-	healTick      = time.Hour
 	healInterval  = 30 * 24 * time.Hour
 )
 
@@ -40,7 +37,7 @@ var leaderLockTimeout = newDynamicTimeout(time.Minute, time.Minute)
 func newBgHealSequence(numDisks int) *healSequence {
 
 	reqInfo := &logger.ReqInfo{API: "BackgroundHeal"}
-	ctx := logger.SetReqInfo(context.Background(), reqInfo)
+	ctx, cancelCtx := context.WithCancel(logger.SetReqInfo(GlobalContext, reqInfo))
 
 	hs := madmin.HealOpts{
 		// Remove objects that do not have read-quorum
@@ -49,7 +46,8 @@ func newBgHealSequence(numDisks int) *healSequence {
 	}
 
 	return &healSequence{
-		sourceCh:    make(chan string),
+		sourceCh:    make(chan healSource),
+		respCh:      make(chan healResult),
 		startTime:   UTCNow(),
 		clientToken: bgHealingUUID,
 		settings:    hs,
@@ -57,12 +55,13 @@ func newBgHealSequence(numDisks int) *healSequence {
 			Summary:      healNotStartedStatus,
 			HealSettings: hs,
 			NumDisks:     numDisks,
-			updateLock:   &sync.RWMutex{},
 		},
-		traverseAndHealDoneCh: make(chan error),
-		stopSignalCh:          make(chan struct{}),
-		ctx:                   ctx,
-		reportProgress:        false,
+		cancelCtx:          cancelCtx,
+		ctx:                ctx,
+		reportProgress:     false,
+		scannedItemsMap:    make(map[madmin.HealItemType]int64),
+		healedItemsMap:     make(map[madmin.HealItemType]int64),
+		healFailedItemsMap: make(map[string]int64),
 	}
 }
 
@@ -73,13 +72,14 @@ func getLocalBackgroundHealStatus() madmin.BgHealState {
 	}
 
 	return madmin.BgHealState{
-		ScannedItemsCount: bgSeq.scannedItemsCount,
+		ScannedItemsCount: bgSeq.getScannedItemsCount(),
 		LastHealActivity:  bgSeq.lastHealActivity,
+		NextHealRound:     UTCNow().Add(durationToNextHealRound(bgSeq.lastHealActivity)),
 	}
 }
 
 // healErasureSet lists and heals all objects in a specific erasure set
-func healErasureSet(ctx context.Context, setIndex int, xlObj *xlObjects) error {
+func healErasureSet(ctx context.Context, setIndex int, xlObj *erasureObjects, drivesPerSet int) error {
 	buckets, err := xlObj.ListBuckets(ctx)
 	if err != nil {
 		return err
@@ -93,88 +93,140 @@ func healErasureSet(ctx context.Context, setIndex int, xlObj *xlObjects) error {
 		if ok {
 			break
 		}
-		time.Sleep(time.Second)
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(time.Second):
+			continue
+		}
 	}
 
 	// Heal all buckets with all objects
 	for _, bucket := range buckets {
 		// Heal current bucket
-		bgSeq.sourceCh <- bucket.Name
+		bgSeq.sourceCh <- healSource{
+			bucket: bucket.Name,
+		}
 
-		// List all objects in the current bucket and heal them
-		listDir := listDirFactory(ctx, xlObj.getLoadBalancedDisks()...)
-		walkResultCh := startTreeWalk(ctx, bucket.Name, "", "", true, listDir, nil)
-		for walkEntry := range walkResultCh {
-			bgSeq.sourceCh <- pathJoin(bucket.Name, walkEntry.entry)
+		var entryChs []FileInfoVersionsCh
+		for _, disk := range xlObj.getLoadBalancedDisks() {
+			if disk == nil {
+				// Disk can be offline
+				continue
+			}
+
+			entryCh, err := disk.WalkVersions(bucket.Name, "", "", true, ctx.Done())
+			if err != nil {
+				// Disk walk returned error, ignore it.
+				continue
+			}
+
+			entryChs = append(entryChs, FileInfoVersionsCh{
+				Ch: entryCh,
+			})
+		}
+
+		entriesValid := make([]bool, len(entryChs))
+		entries := make([]FileInfoVersions, len(entryChs))
+
+		for {
+			entry, quorumCount, ok := lexicallySortedEntryVersions(entryChs, entries, entriesValid)
+			if !ok {
+				break
+			}
+
+			if quorumCount == drivesPerSet {
+				// Skip good entries.
+				continue
+			}
+
+			for _, version := range entry.Versions {
+				bgSeq.sourceCh <- healSource{
+					bucket:    bucket.Name,
+					object:    version.Name,
+					versionID: version.VersionID,
+				}
+			}
 		}
 	}
 
 	return nil
 }
 
-// Healing leader will take the charge of healing all erasure sets
-func execLeaderTasks(z *xlZones) {
-	ctx := context.Background()
+// deepHealObject heals given object path in deep to fix bitrot.
+func deepHealObject(bucket, object, versionID string) {
+	// Get background heal sequence to send elements to heal
+	bgSeq, _ := globalBackgroundHealState.getHealSequenceByToken(bgHealingUUID)
 
-	// Hold a lock so only one server performs auto-healing
-	leaderLock := z.NewNSLock(ctx, minioMetaBucket, "leader")
-	for {
-		err := leaderLock.GetLock(leaderLockTimeout)
-		if err == nil {
-			break
-		}
-		time.Sleep(leaderTick)
-	}
-
-	// Hold a lock for healing the erasure set
-	zeroDuration := time.Millisecond
-	zeroDynamicTimeout := newDynamicTimeout(zeroDuration, zeroDuration)
-
-	lastScanTime := time.Now() // So that we don't heal immediately, but after one month.
-	for {
-		if time.Since(lastScanTime) < healInterval {
-			time.Sleep(healTick)
-			continue
-		}
-		for _, zone := range z.zones {
-			// Heal set by set
-			for i, set := range zone.sets {
-				setLock := z.zones[0].NewNSLock(ctx, "system", fmt.Sprintf("erasure-set-heal-%d", i))
-				if err := setLock.GetLock(zeroDynamicTimeout); err != nil {
-					logger.LogIf(ctx, err)
-					continue
-				}
-				if err := healErasureSet(ctx, i, set); err != nil {
-					setLock.Unlock()
-					logger.LogIf(ctx, err)
-					continue
-				}
-				setLock.Unlock()
-			}
-		}
-		lastScanTime = time.Now()
+	bgSeq.sourceCh <- healSource{
+		bucket:    bucket,
+		object:    object,
+		versionID: versionID,
+		opts:      &madmin.HealOpts{ScanMode: madmin.HealDeepScan},
 	}
 }
 
-func startGlobalHeal() {
-	var objAPI ObjectLayer
-	for {
-		objAPI = newObjectLayerWithoutSafeModeFn()
-		if objAPI == nil {
-			time.Sleep(time.Second)
-			continue
-		}
-		break
+// Returns the duration to the next background healing round
+func durationToNextHealRound(lastHeal time.Time) time.Duration {
+	if lastHeal.IsZero() {
+		lastHeal = globalBootTime
 	}
 
-	zones, ok := objAPI.(*xlZones)
+	d := lastHeal.Add(healInterval).Sub(UTCNow())
+	if d < 0 {
+		return time.Second
+	}
+	return d
+}
+
+// Healing leader will take the charge of healing all erasure sets
+func execLeaderTasks(ctx context.Context, z *erasureZones) {
+	// So that we don't heal immediately, but after one month.
+	lastScanTime := UTCNow()
+	// Get background heal sequence to send elements to heal
+	var bgSeq *healSequence
+	var ok bool
+	for {
+		bgSeq, ok = globalBackgroundHealState.getHealSequenceByToken(bgHealingUUID)
+		if ok {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(time.Second):
+			continue
+		}
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.NewTimer(durationToNextHealRound(lastScanTime)).C:
+			bgSeq.resetHealStatusCounters()
+			for _, zone := range z.zones {
+				// Heal set by set
+				for i, set := range zone.sets {
+					if err := healErasureSet(ctx, i, set, zone.drivesPerSet); err != nil {
+						logger.LogIf(ctx, err)
+						continue
+					}
+				}
+			}
+			lastScanTime = UTCNow()
+		}
+	}
+}
+
+func startGlobalHeal(ctx context.Context, objAPI ObjectLayer) {
+	zones, ok := objAPI.(*erasureZones)
 	if !ok {
 		return
 	}
 
-	execLeaderTasks(zones)
+	execLeaderTasks(ctx, zones)
 }
 
-func initGlobalHeal() {
-	go startGlobalHeal()
+func initGlobalHeal(ctx context.Context, objAPI ObjectLayer) {
+	go startGlobalHeal(ctx, objAPI)
 }

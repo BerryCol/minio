@@ -17,7 +17,6 @@
 package cmd
 
 import (
-	"context"
 	"errors"
 	"net/http"
 	"time"
@@ -48,6 +47,7 @@ var (
 	errAuthentication       = errors.New("Authentication failed, check your access credentials")
 	errNoAuthToken          = errors.New("JWT token missing")
 	errIncorrectCreds       = errors.New("Current access key or secret key is incorrect")
+	errPresignedNotAllowed  = errors.New("Unable to generate shareable URL due to lack of read permissions")
 )
 
 func authenticateJWTUsers(accessKey, secretKey string, expiry time.Duration) (string, error) {
@@ -164,6 +164,6 @@ func webRequestAuthenticate(req *http.Request) (*xjwt.MapClaims, bool, error) {
 func newAuthToken(audience string) string {
 	cred := globalActiveCred
 	token, err := authenticateNode(cred.AccessKey, cred.SecretKey, audience)
-	logger.CriticalIf(context.Background(), err)
+	logger.CriticalIf(GlobalContext, err)
 	return token
 }

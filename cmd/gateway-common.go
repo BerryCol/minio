@@ -55,42 +55,6 @@ var (
 	IsStringEqual = isStringEqual
 )
 
-// StatInfo -  alias for statInfo
-type StatInfo struct {
-	statInfo
-}
-
-// AnonErrToObjectErr - converts standard http codes into meaningful object layer errors.
-func AnonErrToObjectErr(statusCode int, params ...string) error {
-	bucket := ""
-	object := ""
-	if len(params) >= 1 {
-		bucket = params[0]
-	}
-	if len(params) == 2 {
-		object = params[1]
-	}
-
-	switch statusCode {
-	case http.StatusNotFound:
-		if object != "" {
-			return ObjectNotFound{bucket, object}
-		}
-		return BucketNotFound{Bucket: bucket}
-	case http.StatusBadRequest:
-		if object != "" {
-			return ObjectNameInvalid{bucket, object}
-		}
-		return BucketNameInvalid{Bucket: bucket}
-	case http.StatusForbidden:
-		fallthrough
-	case http.StatusUnauthorized:
-		return AllAccessDisabled{bucket, object}
-	}
-
-	return errUnexpected
-}
-
 // FromMinioClientMetadata converts minio metadata to map[string]string
 func FromMinioClientMetadata(metadata map[string][]string) map[string]string {
 	mm := map[string]string{}
@@ -130,7 +94,6 @@ func FromMinioClientListPartsInfo(lopr minio.ListObjectPartsResult) ListPartsInf
 		NextPartNumberMarker: lopr.NextPartNumberMarker,
 		MaxParts:             lopr.MaxParts,
 		IsTruncated:          lopr.IsTruncated,
-		EncodingType:         lopr.EncodingType,
 		Parts:                fromMinioClientObjectParts(lopr.ObjectParts),
 	}
 }
@@ -432,7 +395,7 @@ type MetricsTransport struct {
 // RoundTrip implements the RoundTrip method for MetricsTransport
 func (m MetricsTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	metered := shouldMeterRequest(r)
-	if metered && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
+	if metered && (r.Method == http.MethodPost || r.Method == http.MethodPut) {
 		m.Metrics.IncRequests(r.Method)
 		if r.ContentLength > 0 {
 			m.Metrics.IncBytesSent(uint64(r.ContentLength))
@@ -444,7 +407,8 @@ func (m MetricsTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 		return nil, err
 	}
 	if metered && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
-		if r.ContentLength > 0 {
+		m.Metrics.IncRequests(r.Method)
+		if resp.ContentLength > 0 {
 			m.Metrics.IncBytesReceived(uint64(resp.ContentLength))
 		}
 	}

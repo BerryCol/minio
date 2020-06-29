@@ -93,8 +93,10 @@ http://minio.cluster:9000?Action=AssumeRoleWithWebIdentity&DurationSeconds=3600&
 ```
 export MINIO_ACCESS_KEY=minio
 export MINIO_SECRET_KEY=minio123
-export MINIO_IDENTITY_OPENID_CLIENT_ID="843351d4-1080-11ea-aa20-271ecba3924a"
 export MINIO_IDENTITY_OPENID_CONFIG_URL=https://accounts.google.com/.well-known/openid-configuration
+export MINIO_IDENTITY_OPENID_CLIENT_ID="843351d4-1080-11ea-aa20-271ecba3924a"
+# Optional: Allow to specify the requested OpenID scopes (OpenID only requires the `openid` scope)
+#export MINIO_IDENTITY_OPENID_SCOPES="openid,profile,email"
 minio server /mnt/export
 ```
 
@@ -110,6 +112,24 @@ Testing with an example
 ```
 $ go run web-identity.go -cid 204367807228-ok7601k6gj1pgge7m09h7d79co8p35xx.apps.googleusercontent.com -csec XsT_PgPdT1nO9DD45rMLJw7G
 2018/12/26 17:49:36 listening on http://localhost:8080/
+```
+
+Note: For a reasonable test outcome, make sure the assumed user has at least permission/policy to list all buckets. That policy would look like below:
+```
+{
+  "version": "2012-10-17",
+  "statement": [
+    {
+      "effect": "Allow",
+      "action": [
+        "s3:ListAllMyBuckets"
+      ],
+      "resource": [
+        "arn:aws:s3:::*"
+      ]
+    }
+  ]
+}
 ```
 
 ## Authorization Flow

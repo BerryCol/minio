@@ -1,4 +1,4 @@
-# Deploy MinIO on Kubernetes [![Slack](https://slack.min.io/slack?type=svg)](https://slack.min.io) [![Go Report Card](https://goreportcard.com/badge/minio/minio)](https://goreportcard.com/report/minio/minio) [![Docker Pulls](https://img.shields.io/docker/pulls/minio/minio.svg?maxAge=604800)](https://hub.docker.com/r/minio/minio/)
+# Deploy MinIO on Kubernetes [![Slack](https://slack.min.io/slack?type=svg)](https://slack.min.io)  [![Docker Pulls](https://img.shields.io/docker/pulls/minio/minio.svg?maxAge=604800)](https://hub.docker.com/r/minio/minio/)
 
 MinIO is a high performance distributed object storage server, designed for large-scale private cloud infrastructure. MinIO is designed in a cloud-native manner to scale sustainably in multi-tenant environments. Orchestration platforms like Kubernetes provide perfect cloud-native environment to deploy and scale MinIO.
 
@@ -9,8 +9,6 @@ There are multiple options to deploy MinIO on Kubernetes:
 - MinIO-Operator: Operator offers seamless way to create and update highly available distributed MinIO clusters. Refer [MinIO Operator documentation](https://github.com/minio/minio-operator/blob/master/README.md) for more details.
 
 - Helm Chart: MinIO Helm Chart offers customizable and easy MinIO deployment with a single command. Refer [MinIO Helm Chart documentation](https://github.com/helm/charts/tree/master/stable/minio) for more details.
-
-- YAML File: MinIO can be deployed with `YAML` files via `kubectl`. Refer to the [MinIO `YAML` file documentation](https://github.com/minio/minio/blob/master/docs/orchestration/kubernetes/k8s-yaml.md) for more details.
 
 ## Monitoring MinIO in Kubernetes
 

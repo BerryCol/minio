@@ -24,6 +24,12 @@ var (
 		"Browser can only accept `on` and `off` values. To disable web browser access, set this value to `off`",
 	)
 
+	ErrInvalidFSOSyncValue = newErrFn(
+		"Invalid O_SYNC value",
+		"Please check the passed value",
+		"Can only accept `on` and `off` values. To enable O_SYNC for fs backend, set this value to `on`",
+	)
+
 	ErrInvalidDomainValue = newErrFn(
 		"Invalid domain value",
 		"Please check the passed value",
@@ -33,7 +39,7 @@ var (
 	ErrInvalidErasureSetSize = newErrFn(
 		"Invalid erasure set size",
 		"Please check the passed value",
-		"Erasure set can only accept any of [4, 6, 8, 10, 12, 14, 16] values",
+		"Erasure set can only accept any of [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16] values",
 	)
 
 	ErrInvalidWormValue = newErrFn(
@@ -167,6 +173,18 @@ Refer to the link https://github.com/minio/minio/tree/master/docs/erasure/storag
 		`FS mode requires only one writable disk path
 Example 1:
    $ minio server /data/minio/`,
+	)
+
+	ErrUnsupportedBackend = newErrFn(
+		"Unable to write to the backend",
+		"Please ensure your disk supports O_DIRECT",
+		"",
+	)
+
+	ErrCorruptedBackend = newErrFn(
+		"Unable to use the specified backend, pre-existing content detected",
+		"Please ensure your disk mount does not have any pre-existing content",
+		"",
 	)
 
 	ErrUnableToWriteInBackend = newErrFn(

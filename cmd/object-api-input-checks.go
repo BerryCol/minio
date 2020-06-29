@@ -18,10 +18,12 @@ package cmd
 
 import (
 	"context"
+	"runtime"
+	"strings"
 
+	"github.com/google/uuid"
 	"github.com/minio/minio-go/v6/pkg/s3utils"
 	"github.com/minio/minio/cmd/logger"
-	"github.com/skyrings/skyring-common/tools/uuid"
 )
 
 // Checks on GetObject arguments, bucket and object.
@@ -48,6 +50,10 @@ func checkBucketAndObjectNames(ctx context.Context, bucket, object string) error
 	}
 	if !IsValidObjectPrefix(object) {
 		logger.LogIf(ctx, ObjectNameInvalid{Bucket: bucket, Object: object})
+		return ObjectNameInvalid{Bucket: bucket, Object: object}
+	}
+	if runtime.GOOS == globalWindowsOSName && strings.Contains(object, "\\") {
+		// Objects cannot be contain \ in Windows and is listed as `Characters to Avoid`.
 		return ObjectNameInvalid{Bucket: bucket, Object: object}
 	}
 	return nil
@@ -105,16 +111,8 @@ func checkListMultipartArgs(ctx context.Context, bucket, prefix, keyMarker, uplo
 				KeyMarker:      keyMarker,
 			}
 		}
-		id, err := uuid.Parse(uploadIDMarker)
-		if err != nil {
+		if _, err := uuid.Parse(uploadIDMarker); err != nil {
 			logger.LogIf(ctx, err)
-			return err
-		}
-		if id.IsZero() {
-			logger.LogIf(ctx, MalformedUploadID{
-				UploadID: uploadIDMarker,
-			})
-
 			return MalformedUploadID{
 				UploadID: uploadIDMarker,
 			}

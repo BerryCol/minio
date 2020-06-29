@@ -20,9 +20,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"os"
-	"path/filepath"
-	"time"
 
 	jsoniter "github.com/json-iterator/go"
 	"github.com/minio/minio/cmd/logger"
@@ -30,109 +27,49 @@ import (
 )
 
 const (
-	dataUsageObjName       = "data-usage"
-	dataUsageCrawlInterval = 12 * time.Hour
+	envDataUsageCrawlConf  = "MINIO_DISK_USAGE_CRAWL_ENABLE"
+	envDataUsageCrawlDelay = "MINIO_DISK_USAGE_CRAWL_DELAY"
+	envDataUsageCrawlDebug = "MINIO_DISK_USAGE_CRAWL_DEBUG"
+
+	dataUsageRoot   = SlashSeparator
+	dataUsageBucket = minioMetaBucket + SlashSeparator + bucketMetaPrefix
+
+	dataUsageObjName   = ".usage.json"
+	dataUsageCacheName = ".usage-cache.bin"
+	dataUsageBloomName = ".bloomcycle.bin"
 )
 
-func initDataUsageStats() {
-	go runDataUsageInfoUpdateRoutine()
-}
-
-func runDataUsageInfoUpdateRoutine() {
-	// Wait until the object layer is ready
-	var objAPI ObjectLayer
-	for {
-		objAPI = newObjectLayerWithoutSafeModeFn()
-		if objAPI == nil {
-			time.Sleep(time.Second)
-			continue
-		}
-		break
-	}
-
-	runDataUsageInfo(context.Background(), objAPI, GlobalServiceDoneCh)
-}
-
-// timeToNextCrawl returns the duration until next crawl should occur
-// this is validated by verifying the LastUpdate time.
-func timeToCrawl(ctx context.Context, objAPI ObjectLayer) time.Duration {
-	dataUsageInfo, err := loadDataUsageFromBackend(ctx, objAPI)
-	if err != nil {
-		// Upon an error wait for like 10
-		// seconds to start the crawler.
-		return 10 * time.Second
-	}
-	// File indeed doesn't exist when LastUpdate is zero
-	// so we have never crawled, start crawl right away.
-	if dataUsageInfo.LastUpdate.IsZero() {
-		return 1 * time.Second
-	}
-	waitDuration := dataUsageInfo.LastUpdate.Sub(UTCNow())
-	if waitDuration > dataUsageCrawlInterval {
-		// Waited long enough start crawl in a 1 second
-		return 1 * time.Second
-	}
-	// No crawling needed, ask the routine to wait until
-	// the daily interval 12hrs - delta between last update
-	// with current time.
-	return dataUsageCrawlInterval - waitDuration
-}
-
-var dataUsageLockTimeout = lifecycleLockTimeout
-
-func runDataUsageInfo(ctx context.Context, objAPI ObjectLayer, endCh <-chan struct{}) {
-	locker := objAPI.NewNSLock(ctx, minioMetaBucket, "leader-data-usage-info")
-	for {
-		err := locker.GetLock(dataUsageLockTimeout)
+// storeDataUsageInBackend will store all objects sent on the gui channel until closed.
+func storeDataUsageInBackend(ctx context.Context, objAPI ObjectLayer, gui <-chan DataUsageInfo) {
+	for dataUsageInfo := range gui {
+		dataUsageJSON, err := json.Marshal(dataUsageInfo)
 		if err != nil {
-			time.Sleep(5 * time.Minute)
+			logger.LogIf(ctx, err)
 			continue
 		}
-		// Break without unlocking, this node will acquire
-		// data usage calculator role for its lifetime.
-		break
-	}
+		size := int64(len(dataUsageJSON))
+		r, err := hash.NewReader(bytes.NewReader(dataUsageJSON), size, "", "", size, false)
+		if err != nil {
+			logger.LogIf(ctx, err)
+			continue
+		}
 
-	for {
-		wait := timeToCrawl(ctx, objAPI)
-		select {
-		case <-endCh:
-			locker.Unlock()
-			return
-		case <-time.NewTimer(wait).C:
-			// Crawl only when no previous crawl has occurred,
-			// or its been too long since last crawl.
-			err := storeDataUsageInBackend(ctx, objAPI, objAPI.CrawlAndGetDataUsage(ctx, endCh))
+		_, err = objAPI.PutObject(ctx, dataUsageBucket, dataUsageObjName, NewPutObjReader(r, nil, nil), ObjectOptions{})
+		if !isErrBucketNotFound(err) {
 			logger.LogIf(ctx, err)
 		}
 	}
 }
 
-func storeDataUsageInBackend(ctx context.Context, objAPI ObjectLayer, dataUsageInfo DataUsageInfo) error {
-	dataUsageJSON, err := json.Marshal(dataUsageInfo)
-	if err != nil {
-		return err
-	}
-
-	size := int64(len(dataUsageJSON))
-	r, err := hash.NewReader(bytes.NewReader(dataUsageJSON), size, "", "", size, false)
-	if err != nil {
-		return err
-	}
-
-	_, err = objAPI.PutObject(ctx, minioMetaBackgroundOpsBucket, dataUsageObjName, NewPutObjReader(r, nil, nil), ObjectOptions{})
-	return err
-}
-
 func loadDataUsageFromBackend(ctx context.Context, objAPI ObjectLayer) (DataUsageInfo, error) {
 	var dataUsageInfoJSON bytes.Buffer
 
-	err := objAPI.GetObject(ctx, minioMetaBackgroundOpsBucket, dataUsageObjName, 0, -1, &dataUsageInfoJSON, "", ObjectOptions{})
+	err := objAPI.GetObject(ctx, dataUsageBucket, dataUsageObjName, 0, -1, &dataUsageInfoJSON, "", ObjectOptions{})
 	if err != nil {
-		if isErrObjectNotFound(err) {
+		if isErrObjectNotFound(err) || isErrBucketNotFound(err) {
 			return DataUsageInfo{}, nil
 		}
-		return DataUsageInfo{}, toObjectErr(err, minioMetaBackgroundOpsBucket, dataUsageObjName)
+		return DataUsageInfo{}, toObjectErr(err, dataUsageBucket, dataUsageObjName)
 	}
 
 	var dataUsageInfo DataUsageInfo
@@ -142,63 +79,21 @@ func loadDataUsageFromBackend(ctx context.Context, objAPI ObjectLayer) (DataUsag
 		return DataUsageInfo{}, err
 	}
 
-	return dataUsageInfo, nil
-}
-
-// Item represents each file while walking.
-type Item struct {
-	Path string
-	Typ  os.FileMode
-}
-
-type getSizeFn func(item Item) (int64, error)
-
-func updateUsage(basePath string, doneCh <-chan struct{}, waitForLowActiveIO func(), getSize getSizeFn) DataUsageInfo {
-	var dataUsageInfo = DataUsageInfo{
-		BucketsSizes:          make(map[string]uint64),
-		ObjectsSizesHistogram: make(map[string]uint64),
+	// For forward compatibility reasons, we need to add this code.
+	if len(dataUsageInfo.BucketsUsage) == 0 {
+		dataUsageInfo.BucketsUsage = make(map[string]BucketUsageInfo, len(dataUsageInfo.BucketSizes))
+		for bucket, size := range dataUsageInfo.BucketSizes {
+			dataUsageInfo.BucketsUsage[bucket] = BucketUsageInfo{Size: size}
+		}
 	}
 
-	fastWalk(basePath, 1, doneCh, func(path string, typ os.FileMode) error {
-		// Wait for I/O to go down.
-		waitForLowActiveIO()
-
-		bucket, entry := path2BucketObjectWithBasePath(basePath, path)
-		if bucket == "" {
-			return nil
+	// For backward compatibility reasons, we need to add this code.
+	if len(dataUsageInfo.BucketSizes) == 0 {
+		dataUsageInfo.BucketSizes = make(map[string]uint64, len(dataUsageInfo.BucketsUsage))
+		for bucket, bui := range dataUsageInfo.BucketsUsage {
+			dataUsageInfo.BucketSizes[bucket] = bui.Size
 		}
+	}
 
-		if isReservedOrInvalidBucket(bucket, false) {
-			return filepath.SkipDir
-		}
-
-		if entry == "" && typ&os.ModeDir != 0 {
-			dataUsageInfo.BucketsCount++
-			dataUsageInfo.BucketsSizes[bucket] = 0
-			return nil
-		}
-
-		if typ&os.ModeDir != 0 {
-			return nil
-		}
-
-		t := time.Now()
-		size, err := getSize(Item{path, typ})
-		// Use the response time of the getSize call to guess system load.
-		// Sleep equivalent time.
-		if d := time.Since(t); d > 100*time.Microsecond {
-			time.Sleep(d)
-		}
-		if err != nil {
-			return errSkipFile
-		}
-
-		dataUsageInfo.ObjectsCount++
-		dataUsageInfo.ObjectsTotalSize += uint64(size)
-		dataUsageInfo.BucketsSizes[bucket] += uint64(size)
-		dataUsageInfo.ObjectsSizesHistogram[objSizeToHistoInterval(uint64(size))]++
-		return nil
-	})
-
-	return dataUsageInfo
+	return dataUsageInfo, nil
 }

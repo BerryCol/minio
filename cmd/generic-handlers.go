@@ -1,5 +1,5 @@
 /*
- * MinIO Cloud Storage, (C) 2015, 2016, 2017 MinIO, Inc.
+ * MinIO Cloud Storage, (C) 2015-2020 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,7 +17,6 @@
 package cmd
 
 import (
-	"context"
 	"net/http"
 	"strings"
 	"time"
@@ -28,19 +27,21 @@ import (
 	"github.com/minio/minio/cmd/config/etcd/dns"
 	"github.com/minio/minio/cmd/crypto"
 	xhttp "github.com/minio/minio/cmd/http"
+	"github.com/minio/minio/cmd/http/stats"
 	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/pkg/handlers"
+	"github.com/minio/minio/pkg/wildcard"
 	"github.com/rs/cors"
 )
 
-// HandlerFunc - useful to chain different middleware http.Handler
-type HandlerFunc func(http.Handler) http.Handler
+// MiddlewareFunc - useful to chain different http.Handler middlewares
+type MiddlewareFunc func(http.Handler) http.Handler
 
-func registerHandlers(h http.Handler, handlerFns ...HandlerFunc) http.Handler {
-	for _, hFn := range handlerFns {
-		h = hFn(h)
+func registerMiddlewares(next http.Handler) http.Handler {
+	for _, handlerFn := range globalHandlers {
+		next = handlerFn(next)
 	}
-	return h
+	return next
 }
 
 // Adds limiting body size middleware
@@ -87,7 +88,7 @@ func setRequestHeaderSizeLimitHandler(h http.Handler) http.Handler {
 // of the user-defined metadata to 2 KB.
 func (h requestHeaderSizeLimitHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if isHTTPHeaderSizeTooLarge(r.Header) {
-		writeErrorResponse(context.Background(), w, errorCodes.ToAPIErr(ErrMetadataTooLarge), r.URL, guessIsBrowserReq(r))
+		writeErrorResponse(r.Context(), w, errorCodes.ToAPIErr(ErrMetadataTooLarge), r.URL, guessIsBrowserReq(r))
 		return
 	}
 	h.Handler.ServeHTTP(w, r)
@@ -102,7 +103,7 @@ func isHTTPHeaderSizeTooLarge(header http.Header) bool {
 		length := len(key) + len(header.Get(key))
 		size += length
 		for _, prefix := range userMetadataKeyPrefixes {
-			if HasPrefix(key, prefix) {
+			if strings.HasPrefix(strings.ToLower(key), prefix) {
 				usersize += length
 				break
 			}
@@ -116,7 +117,10 @@ func isHTTPHeaderSizeTooLarge(header http.Header) bool {
 
 // ReservedMetadataPrefix is the prefix of a metadata key which
 // is reserved and for internal use only.
-const ReservedMetadataPrefix = "X-Minio-Internal-"
+const (
+	ReservedMetadataPrefix      = "X-Minio-Internal-"
+	ReservedMetadataPrefixLower = "x-minio-internal-"
+)
 
 type reservedMetadataHandler struct {
 	http.Handler
@@ -130,7 +134,7 @@ func filterReservedMetadata(h http.Handler) http.Handler {
 // would be treated as metadata.
 func (h reservedMetadataHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if containsReservedMetadata(r.Header) {
-		writeErrorResponse(context.Background(), w, errorCodes.ToAPIErr(ErrUnsupportedMetadata), r.URL, guessIsBrowserReq(r))
+		writeErrorResponse(r.Context(), w, errorCodes.ToAPIErr(ErrUnsupportedMetadata), r.URL, guessIsBrowserReq(r))
 		return
 	}
 	h.Handler.ServeHTTP(w, r)
@@ -141,7 +145,7 @@ func (h reservedMetadataHandler) ServeHTTP(w http.ResponseWriter, r *http.Reques
 // and must not set by clients
 func containsReservedMetadata(header http.Header) bool {
 	for key := range header {
-		if HasPrefix(key, ReservedMetadataPrefix) {
+		if strings.HasPrefix(strings.ToLower(key), ReservedMetadataPrefixLower) {
 			return true
 		}
 	}
@@ -353,7 +357,7 @@ func parseAmzDate(amzDateStr string) (amzDate time.Time, apiErr APIErrorCode) {
 // supported amz date formats.
 func parseAmzDateHeader(req *http.Request) (time.Time, APIErrorCode) {
 	for _, amzDateHeader := range amzDateHeaders {
-		amzDateStr := req.Header.Get(http.CanonicalHeaderKey(amzDateHeader))
+		amzDateStr := req.Header.Get(amzDateHeader)
 		if amzDateStr != "" {
 			return parseAmzDate(amzDateStr)
 		}
@@ -371,14 +375,14 @@ func (h timeValidityHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// All our internal APIs are sensitive towards Date
 			// header, for all requests where Date header is not
 			// present we will reject such clients.
-			writeErrorResponse(context.Background(), w, errorCodes.ToAPIErr(errCode), r.URL, guessIsBrowserReq(r))
+			writeErrorResponse(r.Context(), w, errorCodes.ToAPIErr(errCode), r.URL, guessIsBrowserReq(r))
 			return
 		}
 		// Verify if the request date header is shifted by less than globalMaxSkewTime parameter in the past
 		// or in the future, reject request otherwise.
 		curTime := UTCNow()
 		if curTime.Sub(amzDate) > globalMaxSkewTime || amzDate.Sub(curTime) > globalMaxSkewTime {
-			writeErrorResponse(context.Background(), w, errorCodes.ToAPIErr(ErrRequestTimeTooSkewed), r.URL, guessIsBrowserReq(r))
+			writeErrorResponse(r.Context(), w, errorCodes.ToAPIErr(ErrRequestTimeTooSkewed), r.URL, guessIsBrowserReq(r))
 			return
 		}
 	}
@@ -407,7 +411,14 @@ func setCorsHandler(h http.Handler) http.Handler {
 	}
 
 	c := cors.New(cors.Options{
-		AllowedOrigins: []string{"*"},
+		AllowOriginFunc: func(origin string) bool {
+			for _, allowedOrigin := range globalAPIConfig.getCorsAllowOrigins() {
+				if wildcard.MatchSimple(allowedOrigin, origin) {
+					return true
+				}
+			}
+			return false
+		},
 		AllowedMethods: []string{
 			http.MethodGet,
 			http.MethodPut,
@@ -433,73 +444,73 @@ func setIgnoreResourcesHandler(h http.Handler) http.Handler {
 	return resourceHandler{h}
 }
 
+var supportedDummyBucketAPIs = map[string][]string{
+	"acl":            {http.MethodPut, http.MethodGet},
+	"cors":           {http.MethodGet},
+	"website":        {http.MethodGet, http.MethodDelete},
+	"logging":        {http.MethodGet},
+	"accelerate":     {http.MethodGet},
+	"replication":    {http.MethodGet},
+	"requestPayment": {http.MethodGet},
+}
+
+// List of not implemented bucket queries
+var notImplementedBucketResourceNames = map[string]struct{}{
+	"cors":           {},
+	"metrics":        {},
+	"website":        {},
+	"logging":        {},
+	"inventory":      {},
+	"accelerate":     {},
+	"replication":    {},
+	"requestPayment": {},
+}
+
 // Checks requests for not implemented Bucket resources
 func ignoreNotImplementedBucketResources(req *http.Request) bool {
 	for name := range req.URL.Query() {
-		// Enable PutBucketACL, GetBucketACL, GetBucketCors,
-		// GetBucketWebsite, GetBucketAcccelerate,
-		// GetBucketRequestPayment, GetBucketLogging,
-		// GetBucketLifecycle, GetBucketReplication,
-		// GetBucketTagging, GetBucketVersioning,
-		// DeleteBucketTagging, and DeleteBucketWebsite
-		// dummy calls specifically.
-		if name == "acl" && req.Method == http.MethodPut {
-			return false
-		}
-		if ((name == "acl" ||
-			name == "cors" ||
-			name == "website" ||
-			name == "accelerate" ||
-			name == "requestPayment" ||
-			name == "logging" ||
-			name == "lifecycle" ||
-			name == "replication" ||
-			name == "tagging" ||
-			name == "versioning") && req.Method == http.MethodGet) ||
-			((name == "tagging" ||
-				name == "website") && req.Method == http.MethodDelete) {
-			return false
+		methods, ok := supportedDummyBucketAPIs[name]
+		if ok {
+			for _, method := range methods {
+				if method == req.Method {
+					return false
+				}
+			}
 		}
 
-		if notImplementedBucketResourceNames[name] {
+		if _, ok := notImplementedBucketResourceNames[name]; ok {
 			return true
 		}
 	}
 	return false
+}
+
+var supportedDummyObjectAPIs = map[string][]string{
+	"acl": {http.MethodGet, http.MethodPut},
+}
+
+// List of not implemented object APIs
+var notImplementedObjectResourceNames = map[string]struct{}{
+	"restore": {},
+	"torrent": {},
 }
 
 // Checks requests for not implemented Object resources
 func ignoreNotImplementedObjectResources(req *http.Request) bool {
 	for name := range req.URL.Query() {
-		// Enable Get/PutObjectACL dummy call specifically.
-		if name == "acl" && (req.Method == http.MethodGet || req.Method == http.MethodPut) {
-			return false
+		methods, ok := supportedDummyObjectAPIs[name]
+		if ok {
+			for _, method := range methods {
+				if method == req.Method {
+					return false
+				}
+			}
 		}
-		if notImplementedObjectResourceNames[name] {
+		if _, ok := notImplementedObjectResourceNames[name]; ok {
 			return true
 		}
 	}
 	return false
-}
-
-// List of not implemented bucket queries
-var notImplementedBucketResourceNames = map[string]bool{
-	"accelerate":     true,
-	"cors":           true,
-	"inventory":      true,
-	"logging":        true,
-	"metrics":        true,
-	"replication":    true,
-	"requestPayment": true,
-	"tagging":        true,
-	"versioning":     true,
-	"website":        true,
-}
-
-// List of not implemented object queries
-var notImplementedObjectResourceNames = map[string]bool{
-	"restore": true,
-	"torrent": true,
 }
 
 // Resource handler ServeHTTP() wrapper
@@ -509,14 +520,14 @@ func (h resourceHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// If bucketName is present and not objectName check for bucket level resource queries.
 	if bucketName != "" && objectName == "" {
 		if ignoreNotImplementedBucketResources(r) {
-			writeErrorResponse(context.Background(), w, errorCodes.ToAPIErr(ErrNotImplemented), r.URL, guessIsBrowserReq(r))
+			writeErrorResponse(r.Context(), w, errorCodes.ToAPIErr(ErrNotImplemented), r.URL, guessIsBrowserReq(r))
 			return
 		}
 	}
 	// If bucketName and objectName are present check for its resource queries.
 	if bucketName != "" && objectName != "" {
 		if ignoreNotImplementedObjectResources(r) {
-			writeErrorResponse(context.Background(), w, errorCodes.ToAPIErr(ErrNotImplemented), r.URL, guessIsBrowserReq(r))
+			writeErrorResponse(r.Context(), w, errorCodes.ToAPIErr(ErrNotImplemented), r.URL, guessIsBrowserReq(r))
 			return
 		}
 	}
@@ -536,12 +547,21 @@ func setHTTPStatsHandler(h http.Handler) http.Handler {
 }
 
 func (h httpStatsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	isS3Request := !strings.HasPrefix(r.URL.Path, minioReservedBucketPath)
-	// record s3 connection stats.
-	r.Body = &recordTrafficRequest{ReadCloser: r.Body, isS3Request: isS3Request}
-	recordResponse := &recordTrafficResponse{ResponseWriter: w, isS3Request: isS3Request}
+	// Meters s3 connection stats.
+	meteredRequest := &stats.IncomingTrafficMeter{ReadCloser: r.Body}
+	meteredResponse := &stats.OutgoingTrafficMeter{ResponseWriter: w}
+
 	// Execute the request
-	h.handler.ServeHTTP(recordResponse, r)
+	r.Body = meteredRequest
+	h.handler.ServeHTTP(meteredResponse, r)
+
+	if strings.HasPrefix(r.URL.Path, minioReservedBucketPath) {
+		globalConnStats.incInputBytes(meteredRequest.BytesCount())
+		globalConnStats.incOutputBytes(meteredResponse.BytesCount())
+	} else {
+		globalConnStats.incS3InputBytes(meteredRequest.BytesCount())
+		globalConnStats.incS3OutputBytes(meteredResponse.BytesCount())
+	}
 }
 
 // requestValidityHandler validates all the incoming paths for
@@ -589,20 +609,20 @@ func hasMultipleAuth(r *http.Request) bool {
 func (h requestValidityHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Check for bad components in URL path.
 	if hasBadPathComponent(r.URL.Path) {
-		writeErrorResponse(context.Background(), w, errorCodes.ToAPIErr(ErrInvalidResourceName), r.URL, guessIsBrowserReq(r))
+		writeErrorResponse(r.Context(), w, errorCodes.ToAPIErr(ErrInvalidResourceName), r.URL, guessIsBrowserReq(r))
 		return
 	}
 	// Check for bad components in URL query values.
 	for _, vv := range r.URL.Query() {
 		for _, v := range vv {
 			if hasBadPathComponent(v) {
-				writeErrorResponse(context.Background(), w, errorCodes.ToAPIErr(ErrInvalidResourceName), r.URL, guessIsBrowserReq(r))
+				writeErrorResponse(r.Context(), w, errorCodes.ToAPIErr(ErrInvalidResourceName), r.URL, guessIsBrowserReq(r))
 				return
 			}
 		}
 	}
 	if hasMultipleAuth(r) {
-		writeErrorResponse(context.Background(), w, errorCodes.ToAPIErr(ErrInvalidRequest), r.URL, guessIsBrowserReq(r))
+		writeErrorResponse(r.Context(), w, errorCodes.ToAPIErr(ErrInvalidRequest), r.URL, guessIsBrowserReq(r))
 		return
 	}
 	h.handler.ServeHTTP(w, r)
@@ -648,10 +668,10 @@ func (f bucketForwardingHandler) ServeHTTP(w http.ResponseWriter, r *http.Reques
 		sr, err := globalDNSConfig.Get(bucket)
 		if err != nil {
 			if err == dns.ErrNoEntriesFound {
-				writeErrorResponse(context.Background(), w, errorCodes.ToAPIErr(ErrNoSuchBucket),
+				writeErrorResponse(r.Context(), w, errorCodes.ToAPIErr(ErrNoSuchBucket),
 					r.URL, guessIsBrowserReq(r))
 			} else {
-				writeErrorResponse(context.Background(), w, toAPIError(context.Background(), err),
+				writeErrorResponse(r.Context(), w, toAPIError(r.Context(), err),
 					r.URL, guessIsBrowserReq(r))
 			}
 			return
@@ -671,9 +691,12 @@ func (f bucketForwardingHandler) ServeHTTP(w http.ResponseWriter, r *http.Reques
 
 	bucket, object := request2BucketObjectName(r)
 
-	// ListBucket requests should be handled at current endpoint as
-	// all buckets data can be fetched from here.
-	if r.Method == http.MethodGet && bucket == "" && object == "" {
+	// Requests in federated setups for STS type calls which are
+	// performed at '/' resource should be routed by the muxer,
+	// the assumption is simply such that requests without a bucket
+	// in a federated setup cannot be proxied, so serve them at
+	// current server.
+	if bucket == "" {
 		f.handler.ServeHTTP(w, r)
 		return
 	}
@@ -697,9 +720,9 @@ func (f bucketForwardingHandler) ServeHTTP(w http.ResponseWriter, r *http.Reques
 	sr, err := globalDNSConfig.Get(bucket)
 	if err != nil {
 		if err == dns.ErrNoEntriesFound {
-			writeErrorResponse(context.Background(), w, errorCodes.ToAPIErr(ErrNoSuchBucket), r.URL, guessIsBrowserReq(r))
+			writeErrorResponse(r.Context(), w, errorCodes.ToAPIErr(ErrNoSuchBucket), r.URL, guessIsBrowserReq(r))
 		} else {
-			writeErrorResponse(context.Background(), w, toAPIError(context.Background(), err), r.URL, guessIsBrowserReq(r))
+			writeErrorResponse(r.Context(), w, toAPIError(r.Context(), err), r.URL, guessIsBrowserReq(r))
 		}
 		return
 	}
@@ -721,9 +744,9 @@ func (f bucketForwardingHandler) ServeHTTP(w http.ResponseWriter, r *http.Reques
 func setBucketForwardingHandler(h http.Handler) http.Handler {
 	fwd := handlers.NewForwarder(&handlers.Forwarder{
 		PassHost:     true,
-		RoundTripper: NewCustomHTTPTransport(),
+		RoundTripper: NewGatewayHTTPTransport(),
 		Logger: func(err error) {
-			logger.LogIf(context.Background(), err)
+			logger.LogIf(GlobalContext, err)
 		},
 	})
 	return bucketForwardingHandler{fwd, h}
@@ -772,7 +795,8 @@ type criticalErrorHandler struct{ handler http.Handler }
 func (h criticalErrorHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer func() {
 		if err := recover(); err == logger.ErrCritical { // handle
-			writeErrorResponse(context.Background(), w, errorCodes.ToAPIErr(ErrInternalError), r.URL, guessIsBrowserReq(r))
+			writeErrorResponse(r.Context(), w, errorCodes.ToAPIErr(ErrInternalError), r.URL, guessIsBrowserReq(r))
+			return
 		} else if err != nil {
 			panic(err) // forward other panic calls
 		}
@@ -791,7 +815,7 @@ func (h sseTLSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodHead {
 			writeErrorResponseHeadersOnly(w, errorCodes.ToAPIErr(ErrInsecureSSECustomerRequest))
 		} else {
-			writeErrorResponse(context.Background(), w, errorCodes.ToAPIErr(ErrInsecureSSECustomerRequest), r.URL, guessIsBrowserReq(r))
+			writeErrorResponse(r.Context(), w, errorCodes.ToAPIErr(ErrInsecureSSECustomerRequest), r.URL, guessIsBrowserReq(r))
 		}
 		return
 	}

@@ -24,6 +24,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	jwtgo "github.com/dgrijalva/jwt-go"
@@ -168,7 +169,10 @@ func updateClaimsExpiry(dsecs string, claims map[string]interface{}) error {
 // Validate - validates the access token.
 func (p *JWT) Validate(token, dsecs string) (map[string]interface{}, error) {
 	jp := new(jwtgo.Parser)
-	jp.ValidMethods = []string{"RS256", "RS384", "RS512", "ES256", "ES384", "ES512"}
+	jp.ValidMethods = []string{
+		"RS256", "RS384", "RS512", "ES256", "ES384", "ES512",
+		"RS3256", "RS3384", "RS3512", "ES3256", "ES3384", "ES3512",
+	}
 
 	keyFuncCallback := func(jwtToken *jwtgo.Token) (interface{}, error) {
 		kid, ok := jwtToken.Header["kid"].(string)
@@ -214,12 +218,14 @@ const (
 	ClaimName   = "claim_name"
 	ClaimPrefix = "claim_prefix"
 	ClientID    = "client_id"
+	Scopes      = "scopes"
 
 	EnvIdentityOpenIDClientID    = "MINIO_IDENTITY_OPENID_CLIENT_ID"
 	EnvIdentityOpenIDJWKSURL     = "MINIO_IDENTITY_OPENID_JWKS_URL"
 	EnvIdentityOpenIDURL         = "MINIO_IDENTITY_OPENID_CONFIG_URL"
 	EnvIdentityOpenIDClaimName   = "MINIO_IDENTITY_OPENID_CLAIM_NAME"
 	EnvIdentityOpenIDClaimPrefix = "MINIO_IDENTITY_OPENID_CLAIM_PREFIX"
+	EnvIdentityOpenIDScopes      = "MINIO_IDENTITY_OPENID_SCOPES"
 )
 
 // DiscoveryDoc - parses the output from openid-configuration
@@ -285,6 +291,10 @@ var (
 			Value: "",
 		},
 		config.KV{
+			Key:   Scopes,
+			Value: "",
+		},
+		config.KV{
 			Key:   JwksURL,
 			Value: "",
 		},
@@ -326,6 +336,19 @@ func LookupConfig(kvs config.KVS, transport *http.Transport, closeRespFn func(io
 		if err != nil {
 			return c, err
 		}
+	}
+
+	if scopeList := env.Get(EnvIdentityOpenIDScopes, kvs.Get(Scopes)); scopeList != "" {
+		var scopes []string
+		for _, scope := range strings.Split(scopeList, ",") {
+			scope = strings.TrimSpace(scope)
+			if scope == "" {
+				return c, config.Errorf("empty scope value is not allowed '%s', please refer to our documentation", scopeList)
+			}
+			scopes = append(scopes, scope)
+		}
+		// Replace the discovery document scopes by client customized scopes.
+		c.DiscoveryDoc.ScopesSupported = scopes
 	}
 
 	if c.ClaimName == "" {

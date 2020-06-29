@@ -27,7 +27,6 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -49,6 +48,10 @@ import (
 	"github.com/gorilla/mux"
 )
 
+const (
+	slashSeparator = "/"
+)
+
 // IsErrIgnored returns whether given error is ignored or not.
 func IsErrIgnored(err error, ignoredErrs ...error) bool {
 	return IsErr(err, ignoredErrs...)
@@ -67,7 +70,7 @@ func IsErr(err error, errs ...error) bool {
 func request2BucketObjectName(r *http.Request) (bucketName, objectName string) {
 	path, err := getResource(r.URL.Path, r.Host, globalDomainNames)
 	if err != nil {
-		logger.CriticalIf(context.Background(), err)
+		logger.CriticalIf(GlobalContext, err)
 	}
 
 	return path2BucketObject(path)
@@ -87,6 +90,22 @@ func path2BucketObjectWithBasePath(basePath, path string) (bucket, prefix string
 
 func path2BucketObject(s string) (bucket, prefix string) {
 	return path2BucketObjectWithBasePath("", s)
+}
+
+func getDefaultParityBlocks(drive int) int {
+	return drive / 2
+}
+
+func getDefaultDataBlocks(drive int) int {
+	return drive - getDefaultParityBlocks(drive)
+}
+
+func getReadQuorum(drive int) int {
+	return getDefaultDataBlocks(drive)
+}
+
+func getWriteQuorum(drive int) int {
+	return getDefaultDataBlocks(drive) + 1
 }
 
 // URI scheme constants.
@@ -127,6 +146,12 @@ func checkValidMD5(h http.Header) ([]byte, error) {
 	return []byte{}, nil
 }
 
+// hasContentMD5 returns true if Content-MD5 header is set.
+func hasContentMD5(h http.Header) bool {
+	_, ok := h[xhttp.ContentMD5]
+	return ok
+}
+
 /// http://docs.aws.amazon.com/AmazonS3/latest/dev/UploadingObjects.html
 const (
 	// Maximum object size per PUT request is 5TB.
@@ -145,10 +170,8 @@ const (
 	// (Acceptable values range from 1 to 10000 inclusive)
 	globalMaxPartID = 10000
 
-	// Default values used while communicating for
-	// internode communication.
-	defaultDialTimeout   = 15 * time.Second
-	defaultDialKeepAlive = 20 * time.Second
+	// Default values used while communicating for internode communication.
+	defaultDialTimeout = 5 * time.Second
 )
 
 // isMaxObjectSize - verify if max object size
@@ -190,13 +213,14 @@ type profilerWrapper struct {
 	// Profile recorded at start of benchmark.
 	base   []byte
 	stopFn func() ([]byte, error)
+	ext    string
 }
 
 // recordBase will record the profile and store it as the base.
-func (p *profilerWrapper) recordBase(name string) {
+func (p *profilerWrapper) recordBase(name string, debug int) {
 	var buf bytes.Buffer
 	p.base = nil
-	err := pprof.Lookup(name).WriteTo(&buf, 0)
+	err := pprof.Lookup(name).WriteTo(&buf, debug)
 	if err != nil {
 		return
 	}
@@ -211,6 +235,11 @@ func (p profilerWrapper) Base() []byte {
 // Stop the currently running benchmark.
 func (p profilerWrapper) Stop() ([]byte, error) {
 	return p.stopFn()
+}
+
+// Extension returns the extension without dot prefix.
+func (p profilerWrapper) Extension() string {
+	return p.ext
 }
 
 // Returns current profile data, returns error if there is no active
@@ -230,11 +259,11 @@ func getProfileData() (map[string][]byte, error) {
 		buf, err := prof.Stop()
 		delete(globalProfiler, typ)
 		if err == nil {
-			dst[typ] = buf
+			dst[typ+"."+prof.Extension()] = buf
 		}
 		buf = prof.Base()
 		if len(buf) > 0 {
-			dst[typ+"-before"] = buf
+			dst[typ+"-before"+"."+prof.Extension()] = buf
 		}
 	}
 	return dst, nil
@@ -249,7 +278,7 @@ func setDefaultProfilerRates() {
 // Starts a profiler returns nil if profiler is not enabled, caller needs to handle this.
 func startProfiler(profilerType string) (minioProfiler, error) {
 	var prof profilerWrapper
-
+	prof.ext = "pprof"
 	// Enable profiler and set the name of the file that pkg/pprof
 	// library creates to store profiling data.
 	switch madmin.ProfilerType(profilerType) {
@@ -278,7 +307,7 @@ func startProfiler(profilerType string) (minioProfiler, error) {
 		}
 	case madmin.ProfilerMEM:
 		runtime.GC()
-		prof.recordBase("heap")
+		prof.recordBase("heap", 0)
 		prof.stopFn = func() ([]byte, error) {
 			runtime.GC()
 			var buf bytes.Buffer
@@ -286,7 +315,7 @@ func startProfiler(profilerType string) (minioProfiler, error) {
 			return buf.Bytes(), err
 		}
 	case madmin.ProfilerBlock:
-		prof.recordBase("block")
+		prof.recordBase("block", 0)
 		runtime.SetBlockProfileRate(1)
 		prof.stopFn = func() ([]byte, error) {
 			var buf bytes.Buffer
@@ -295,7 +324,7 @@ func startProfiler(profilerType string) (minioProfiler, error) {
 			return buf.Bytes(), err
 		}
 	case madmin.ProfilerMutex:
-		prof.recordBase("mutex")
+		prof.recordBase("mutex", 0)
 		runtime.SetMutexProfileFraction(1)
 		prof.stopFn = func() ([]byte, error) {
 			var buf bytes.Buffer
@@ -304,10 +333,18 @@ func startProfiler(profilerType string) (minioProfiler, error) {
 			return buf.Bytes(), err
 		}
 	case madmin.ProfilerThreads:
-		prof.recordBase("threadcreate")
+		prof.recordBase("threadcreate", 0)
 		prof.stopFn = func() ([]byte, error) {
 			var buf bytes.Buffer
 			err := pprof.Lookup("threadcreate").WriteTo(&buf, 0)
+			return buf.Bytes(), err
+		}
+	case madmin.ProfilerGoroutines:
+		prof.ext = "txt"
+		prof.recordBase("goroutine", 1)
+		prof.stopFn = func() ([]byte, error) {
+			var buf bytes.Buffer
+			err := pprof.Lookup("goroutine").WriteTo(&buf, 1)
 			return buf.Bytes(), err
 		}
 	case madmin.ProfilerTrace:
@@ -324,6 +361,7 @@ func startProfiler(profilerType string) (minioProfiler, error) {
 		if err != nil {
 			return nil, err
 		}
+		prof.ext = "trace"
 		prof.stopFn = func() ([]byte, error) {
 			trace.Stop()
 			err := f.Close()
@@ -346,6 +384,8 @@ type minioProfiler interface {
 	Base() []byte
 	// Stop the profiler
 	Stop() ([]byte, error)
+	// Return extension of profile
+	Extension() string
 }
 
 // Global profiler to be used by service go-routine.
@@ -409,27 +449,16 @@ func ToS3ETag(etag string) string {
 	return etag
 }
 
-type dialContext func(ctx context.Context, network, address string) (net.Conn, error)
-
-func newCustomDialContext(dialTimeout, dialKeepAlive time.Duration) dialContext {
-	return func(ctx context.Context, network, addr string) (net.Conn, error) {
-		dialer := &net.Dialer{
-			Timeout:   dialTimeout,
-			KeepAlive: dialKeepAlive,
-		}
-
-		return dialer.DialContext(ctx, network, addr)
-	}
-}
-
-func newCustomHTTPTransport(tlsConfig *tls.Config, dialTimeout, dialKeepAlive time.Duration) func() *http.Transport {
+func newCustomHTTPTransport(tlsConfig *tls.Config, dialTimeout time.Duration) func() *http.Transport {
 	// For more details about various values used here refer
 	// https://golang.org/pkg/net/http/#Transport documentation
 	tr := &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
-		DialContext:           newCustomDialContext(dialTimeout, dialKeepAlive),
-		MaxIdleConnsPerHost:   256,
-		IdleConnTimeout:       60 * time.Second,
+		DialContext:           xhttp.NewCustomDialContext(dialTimeout, 15*time.Second),
+		MaxIdleConnsPerHost:   16,
+		MaxIdleConns:          16,
+		IdleConnTimeout:       1 * time.Minute,
+		ResponseHeaderTimeout: 3 * time.Minute, // Set conservative timeouts for MinIO internode.
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 10 * time.Second,
 		TLSClientConfig:       tlsConfig,
@@ -443,14 +472,22 @@ func newCustomHTTPTransport(tlsConfig *tls.Config, dialTimeout, dialKeepAlive ti
 	}
 }
 
-// NewCustomHTTPTransport returns a new http configuration
+// NewGatewayHTTPTransport returns a new http configuration
 // used while communicating with the cloud backends.
 // This sets the value for MaxIdleConnsPerHost from 2 (go default)
 // to 256.
-func NewCustomHTTPTransport() *http.Transport {
-	return newCustomHTTPTransport(&tls.Config{
+func NewGatewayHTTPTransport() *http.Transport {
+	tr := newCustomHTTPTransport(&tls.Config{
 		RootCAs: globalRootCAs,
-	}, defaultDialTimeout, defaultDialKeepAlive)()
+	}, defaultDialTimeout)()
+	// Set aggressive timeouts for gateway
+	tr.ResponseHeaderTimeout = 1 * time.Minute
+
+	// Allow more requests to be in flight.
+	tr.MaxConnsPerHost = 256
+	tr.MaxIdleConnsPerHost = 16
+	tr.MaxIdleConns = 256
+	return tr
 }
 
 // Load the json (typically from disk file).
@@ -541,13 +578,6 @@ func restQueries(keys ...string) []string {
 	return accumulator
 }
 
-// Reverse the input order of a slice of string
-func reverseStringSlice(input []string) {
-	for left, right := 0, len(input)-1; left < right; left, right = left+1, right-1 {
-		input[left], input[right] = input[right], input[left]
-	}
-}
-
 // lcp finds the longest common prefix of the input strings.
 // It compares by bytes instead of runes (Unicode code points).
 // It's up to the caller to do Unicode normalization if desired
@@ -584,23 +614,77 @@ func lcp(l []string) string {
 // Returns the mode in which MinIO is running
 func getMinioMode() string {
 	mode := globalMinioModeFS
-	if globalIsDistXL {
-		mode = globalMinioModeDistXL
-	} else if globalIsXL {
-		mode = globalMinioModeXL
+	if globalIsDistErasure {
+		mode = globalMinioModeDistErasure
+	} else if globalIsErasure {
+		mode = globalMinioModeErasure
 	} else if globalIsGateway {
 		mode = globalMinioModeGatewayPrefix + globalGatewayName
 	}
 	return mode
 }
 
-func iamPolicyClaimName() string {
+func iamPolicyClaimNameOpenID() string {
 	return globalOpenIDConfig.ClaimPrefix + globalOpenIDConfig.ClaimName
 }
 
-func isWORMEnabled(bucket string) bool {
-	if isMinioMetaBucketName(bucket) {
-		return false
+func iamPolicyClaimNameSA() string {
+	return "sa-policy"
+}
+
+// timedValue contains a synchronized value that is considered valid
+// for a specific amount of time.
+// An Update function must be set to provide an updated value when needed.
+type timedValue struct {
+	// Update must return an updated value.
+	// If an error is returned the cached value is not set.
+	// Only one caller will call this function at any time, others will be blocking.
+	// The returned value can no longer be modified once returned.
+	// Should be set before calling Get().
+	Update func() (interface{}, error)
+
+	// TTL for a cached value.
+	// If not set 1 second TTL is assumed.
+	// Should be set before calling Get().
+	TTL time.Duration
+
+	// Once can be used to initialize values for lazy initialization.
+	// Should be set before calling Get().
+	Once sync.Once
+
+	// Managed values.
+	value      interface{}
+	lastUpdate time.Time
+	mu         sync.Mutex
+}
+
+// Get will return a cached value or fetch a new one.
+// If the Update function returns an error the value is forwarded as is and not cached.
+func (t *timedValue) Get() (interface{}, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.TTL <= 0 {
+		t.TTL = time.Second
 	}
-	return globalWORMEnabled
+	if t.value != nil {
+		if time.Since(t.lastUpdate) < t.TTL {
+			v := t.value
+			return v, nil
+		}
+		t.value = nil
+	}
+	v, err := t.Update()
+	if err != nil {
+		return v, err
+	}
+	t.value = v
+	t.lastUpdate = time.Now()
+	return v, nil
+}
+
+// Invalidate the value in the cache.
+func (t *timedValue) Invalidate() {
+	t.mu.Lock()
+	t.value = nil
+	t.mu.Unlock()
 }

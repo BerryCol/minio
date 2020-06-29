@@ -47,6 +47,11 @@ func newCoreDNSMsg(ip string, port string, ttl uint32, t time.Time) ([]byte, err
 	})
 }
 
+// Close closes the internal etcd client and cannot be used further
+func (c *CoreDNS) Close() {
+	c.etcdClient.Close()
+}
+
 // List - Retrieves list of DNS entries for the domain.
 func (c *CoreDNS) List() (map[string][]SrvRecord, error) {
 	var srvRecords = map[string][]SrvRecord{}
@@ -60,11 +65,7 @@ func (c *CoreDNS) List() (map[string][]SrvRecord, error) {
 			if record.Key == "" {
 				continue
 			}
-			if _, ok := srvRecords[record.Key]; ok {
-				srvRecords[record.Key] = append(srvRecords[record.Key], record)
-			} else {
-				srvRecords[record.Key] = []SrvRecord{record}
-			}
+			srvRecords[record.Key] = append(srvRecords[record.Key], record)
 		}
 	}
 	return srvRecords, nil

@@ -46,13 +46,14 @@ const (
 	letterIdxMask = 1<<letterIdxBits - 1 // All 1-bits, as many as letterIdxBits
 	letterIdxMax  = 63 / letterIdxBits   // # of letter indices fitting in 63 bits
 )
+
+// different kinds of test failures
 const (
 	PASS = "PASS" // Indicate that a test passed
 	FAIL = "FAIL" // Indicate that a test failed
-	NA   = "NA"   // Indicate that a test is not applicable
 )
 
-type ErrorResponse struct {
+type errorResponse struct {
 	XMLName    xml.Name `xml:"Error" json:"-"`
 	Code       string
 	Message    string
@@ -234,6 +235,11 @@ func testPresignedPutInvalidHash(s3Client *s3.S3) {
 	}
 
 	rreq, err := http.NewRequest("PUT", url, bytes.NewReader([]byte("")))
+	if err != nil {
+		failureLog(function, args, startTime, "", "AWS SDK Go presigned PUT request failed", err).Fatal()
+		return
+	}
+
 	rreq.Header.Add("X-Amz-Content-Sha256", "invalid-sha256")
 	rreq.Header.Add("Content-Type", "application/octet-stream")
 
@@ -245,7 +251,7 @@ func testPresignedPutInvalidHash(s3Client *s3.S3) {
 	defer resp.Body.Close()
 
 	dec := xml.NewDecoder(resp.Body)
-	errResp := ErrorResponse{}
+	errResp := errorResponse{}
 	err = dec.Decode(&errResp)
 	if err != nil {
 		failureLog(function, args, startTime, "", "AWS SDK Go unmarshalling xml failed", err).Fatal()
@@ -390,6 +396,10 @@ func testSelectObject(s3Client *s3.S3) {
 		Key:    aws.String(object1),
 	}
 	_, err = s3Client.PutObject(putInput1)
+	if err != nil {
+		failureLog(function, args, startTime, "", fmt.Sprintf("AWS SDK Go Select object failed %v", err), err).Fatal()
+		return
+	}
 
 	defer cleanup(s3Client, bucket, object1, function, args, startTime, true)
 
@@ -470,6 +480,10 @@ func testSelectObject(s3Client *s3.S3) {
 		Key:    aws.String(object2),
 	}
 	_, err = s3Client.PutObject(putInput2)
+	if err != nil {
+		failureLog(function, args, startTime, "", fmt.Sprintf("AWS SDK Go Select object upload failed: %v", err), err).Fatal()
+		return
+	}
 
 	defer cleanup(s3Client, bucket, object2, function, args, startTime, false)
 
@@ -612,7 +626,7 @@ func testObjectTagging(s3Client *s3.S3) {
 
 func testObjectTaggingErrors(s3Client *s3.S3) {
 	startTime := time.Now()
-	function := "testObjectTagging"
+	function := "testObjectTaggingErrors"
 	bucket := randString(60, rand.NewSource(time.Now().UnixNano()), "aws-sdk-go-test-")
 	object := randString(60, rand.NewSource(time.Now().UnixNano()), "")
 	args := map[string]interface{}{
@@ -696,7 +710,7 @@ func testObjectTaggingErrors(s3Client *s3.S3) {
 
 	_, err = s3Client.PutObjectTagging(input)
 	if err == nil {
-		failureLog(function, args, startTime, "", fmt.Sprintf("AWS SDK Go PUT expected to fail but succeeded"), err).Fatal()
+		failureLog(function, args, startTime, "", "AWS SDK Go PUT expected to fail but succeeded", err).Fatal()
 		return
 	}
 
@@ -727,7 +741,7 @@ func testObjectTaggingErrors(s3Client *s3.S3) {
 
 	_, err = s3Client.PutObjectTagging(input)
 	if err == nil {
-		failureLog(function, args, startTime, "", fmt.Sprintf("AWS SDK Go PUT expected to fail but succeeded"), err).Fatal()
+		failureLog(function, args, startTime, "", "AWS SDK Go PUT expected to fail but succeeded", err).Fatal()
 		return
 	}
 
@@ -758,7 +772,7 @@ func testObjectTaggingErrors(s3Client *s3.S3) {
 
 	_, err = s3Client.PutObjectTagging(input)
 	if err == nil {
-		failureLog(function, args, startTime, "", fmt.Sprintf("AWS SDK Go PUT expected to fail but succeeded"), err).Fatal()
+		failureLog(function, args, startTime, "", "AWS SDK Go PUT expected to fail but succeeded", err).Fatal()
 		return
 	}
 
@@ -789,7 +803,7 @@ func testObjectTaggingErrors(s3Client *s3.S3) {
 
 	_, err = s3Client.PutObjectTagging(input)
 	if err == nil {
-		failureLog(function, args, startTime, "", fmt.Sprintf("AWS SDK Go PUT expected to fail but succeeded"), err).Fatal()
+		failureLog(function, args, startTime, "", "AWS SDK Go PUT expected to fail but succeeded", err).Fatal()
 		return
 	}
 

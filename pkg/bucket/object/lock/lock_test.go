@@ -31,25 +31,25 @@ import (
 func TestParseMode(t *testing.T) {
 	testCases := []struct {
 		value        string
-		expectedMode Mode
+		expectedMode RetMode
 	}{
 		{
 			value:        "governance",
-			expectedMode: Governance,
+			expectedMode: RetGovernance,
 		},
 		{
 			value:        "complIAnce",
-			expectedMode: Compliance,
+			expectedMode: RetCompliance,
 		},
 		{
 			value:        "gce",
-			expectedMode: Invalid,
+			expectedMode: "",
 		},
 	}
 
 	for _, tc := range testCases {
-		if parseMode(tc.value) != tc.expectedMode {
-			t.Errorf("Expected Mode %s, got %s", tc.expectedMode, parseMode(tc.value))
+		if parseRetMode(tc.value) != tc.expectedMode {
+			t.Errorf("Expected Mode %s, got %s", tc.expectedMode, parseRetMode(tc.value))
 		}
 	}
 }
@@ -60,11 +60,11 @@ func TestParseLegalHoldStatus(t *testing.T) {
 	}{
 		{
 			value:          "ON",
-			expectedStatus: ON,
+			expectedStatus: LegalHoldOn,
 		},
 		{
 			value:          "Off",
-			expectedStatus: OFF,
+			expectedStatus: LegalHoldOff,
 		},
 		{
 			value:          "x",
@@ -98,32 +98,32 @@ func TestUnmarshalDefaultRetention(t *testing.T) {
 			expectErr:   true,
 		},
 		{
-			value:       DefaultRetention{Mode: "GOVERNANCE"},
+			value:       DefaultRetention{Mode: RetGovernance},
 			expectedErr: fmt.Errorf("either Days or Years must be specified"),
 			expectErr:   true,
 		},
 		{
-			value:       DefaultRetention{Mode: "GOVERNANCE", Days: &days},
+			value:       DefaultRetention{Mode: RetGovernance, Days: &days},
 			expectedErr: nil,
 			expectErr:   false,
 		},
 		{
-			value:       DefaultRetention{Mode: "GOVERNANCE", Years: &years},
+			value:       DefaultRetention{Mode: RetGovernance, Years: &years},
 			expectedErr: nil,
 			expectErr:   false,
 		},
 		{
-			value:       DefaultRetention{Mode: "GOVERNANCE", Days: &days, Years: &years},
+			value:       DefaultRetention{Mode: RetGovernance, Days: &days, Years: &years},
 			expectedErr: fmt.Errorf("either Days or Years must be specified, not both"),
 			expectErr:   true,
 		},
 		{
-			value:       DefaultRetention{Mode: "GOVERNANCE", Days: &zerodays},
+			value:       DefaultRetention{Mode: RetGovernance, Days: &zerodays},
 			expectedErr: fmt.Errorf("Default retention period must be a positive integer value for 'Days'"),
 			expectErr:   true,
 		},
 		{
-			value:       DefaultRetention{Mode: "GOVERNANCE", Days: &invalidDays},
+			value:       DefaultRetention{Mode: RetGovernance, Days: &invalidDays},
 			expectedErr: fmt.Errorf("Default retention period too large for 'Days' %d", invalidDays),
 			expectErr:   true,
 		},
@@ -154,17 +154,17 @@ func TestParseObjectLockConfig(t *testing.T) {
 		expectErr   bool
 	}{
 		{
-			value:       "<ObjectLockConfiguration  xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\" ><ObjectLockEnabled>yes</ObjectLockEnabled></ObjectLockConfiguration>",
-			expectedErr: fmt.Errorf("only 'Enabled' value is allowd to ObjectLockEnabled element"),
+			value:       `<ObjectLockConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><ObjectLockEnabled>yes</ObjectLockEnabled></ObjectLockConfiguration>`,
+			expectedErr: fmt.Errorf("only 'Enabled' value is allowed to ObjectLockEnabled element"),
 			expectErr:   true,
 		},
 		{
-			value:       "<ObjectLockConfiguration  xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><ObjectLockEnabled>Enabled</ObjectLockEnabled><Rule><DefaultRetention><Mode>COMPLIANCE</Mode><Days>0</Days></DefaultRetention></Rule></ObjectLockConfiguration>",
+			value:       `<ObjectLockConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><ObjectLockEnabled>Enabled</ObjectLockEnabled><Rule><DefaultRetention><Mode>COMPLIANCE</Mode><Days>0</Days></DefaultRetention></Rule></ObjectLockConfiguration>`,
 			expectedErr: fmt.Errorf("Default retention period must be a positive integer value for 'Days'"),
 			expectErr:   true,
 		},
 		{
-			value:       "<ObjectLockConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><ObjectLockEnabled>Enabled</ObjectLockEnabled><Rule><DefaultRetention><Mode>COMPLIANCE</Mode><Days>30</Days></DefaultRetention></Rule></ObjectLockConfiguration>",
+			value:       `<ObjectLockConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><ObjectLockEnabled>Enabled</ObjectLockEnabled><Rule><DefaultRetention><Mode>COMPLIANCE</Mode><Days>30</Days></DefaultRetention></Rule></ObjectLockConfiguration>`,
 			expectedErr: nil,
 			expectErr:   false,
 		},
@@ -190,17 +190,17 @@ func TestParseObjectRetention(t *testing.T) {
 		expectErr   bool
 	}{
 		{
-			value:       "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Retention xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Mode>string</Mode><RetainUntilDate>2020-01-02T15:04:05Z</RetainUntilDate></Retention>",
+			value:       `<?xml version="1.0" encoding="UTF-8"?><Retention xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Mode>string</Mode><RetainUntilDate>2020-01-02T15:04:05Z</RetainUntilDate></Retention>`,
 			expectedErr: ErrUnknownWORMModeDirective,
 			expectErr:   true,
 		},
 		{
-			value:       "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Retention xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Mode>COMPLIANCE</Mode><RetainUntilDate>2017-01-02T15:04:05Z</RetainUntilDate></Retention>",
+			value:       `<?xml version="1.0" encoding="UTF-8"?><Retention xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Mode>COMPLIANCE</Mode><RetainUntilDate>2017-01-02T15:04:05Z</RetainUntilDate></Retention>`,
 			expectedErr: ErrPastObjectLockRetainDate,
 			expectErr:   true,
 		},
 		{
-			value:       "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Retention xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Mode>GOVERNANCE</Mode><RetainUntilDate>2057-01-02T15:04:05Z</RetainUntilDate></Retention>",
+			value:       `<?xml version="1.0" encoding="UTF-8"?><Retention xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Mode>GOVERNANCE</Mode><RetainUntilDate>2057-01-02T15:04:05Z</RetainUntilDate></Retention>`,
 			expectedErr: nil,
 			expectErr:   false,
 		},
@@ -234,20 +234,20 @@ func TestIsObjectLockRequested(t *testing.T) {
 		},
 		{
 			header: http.Header{
-				xhttp.AmzObjectLockLegalHold: []string{""},
+				AmzObjectLockLegalHold: []string{""},
 			},
 			expectedVal: true,
 		},
 		{
 			header: http.Header{
-				xhttp.AmzObjectLockRetainUntilDate: []string{""},
-				xhttp.AmzObjectLockMode:            []string{""},
+				AmzObjectLockRetainUntilDate: []string{""},
+				AmzObjectLockMode:            []string{""},
 			},
 			expectedVal: true,
 		},
 		{
 			header: http.Header{
-				xhttp.AmzObjectLockBypassGovernance: []string{""},
+				AmzObjectLockBypassRetGovernance: []string{""},
 			},
 			expectedVal: false,
 		},
@@ -275,26 +275,26 @@ func TestIsObjectLockGovernanceBypassSet(t *testing.T) {
 		},
 		{
 			header: http.Header{
-				xhttp.AmzObjectLockLegalHold: []string{""},
+				AmzObjectLockLegalHold: []string{""},
 			},
 			expectedVal: false,
 		},
 		{
 			header: http.Header{
-				xhttp.AmzObjectLockRetainUntilDate: []string{""},
-				xhttp.AmzObjectLockMode:            []string{""},
+				AmzObjectLockRetainUntilDate: []string{""},
+				AmzObjectLockMode:            []string{""},
 			},
 			expectedVal: false,
 		},
 		{
 			header: http.Header{
-				xhttp.AmzObjectLockBypassGovernance: []string{""},
+				AmzObjectLockBypassRetGovernance: []string{""},
 			},
 			expectedVal: false,
 		},
 		{
 			header: http.Header{
-				xhttp.AmzObjectLockBypassGovernance: []string{"true"},
+				AmzObjectLockBypassRetGovernance: []string{"true"},
 			},
 			expectedVal: true,
 		},
@@ -394,7 +394,7 @@ func TestGetObjectRetentionMeta(t *testing.T) {
 			metadata: map[string]string{
 				"x-amz-object-lock-mode": "governance",
 			},
-			expected: ObjectRetention{Mode: Governance},
+			expected: ObjectRetention{Mode: RetGovernance},
 		},
 		{
 			metadata: map[string]string{
@@ -427,13 +427,13 @@ func TestGetObjectLegalHoldMeta(t *testing.T) {
 			metadata: map[string]string{
 				"x-amz-object-lock-legal-hold": "on",
 			},
-			expected: ObjectLegalHold{Status: ON},
+			expected: ObjectLegalHold{Status: LegalHoldOn},
 		},
 		{
 			metadata: map[string]string{
 				"x-amz-object-lock-legal-hold": "off",
 			},
-			expected: ObjectLegalHold{Status: OFF},
+			expected: ObjectLegalHold{Status: LegalHoldOff},
 		},
 		{
 			metadata: map[string]string{
@@ -458,17 +458,17 @@ func TestParseObjectLegalHold(t *testing.T) {
 		expectErr   bool
 	}{
 		{
-			value:       "<?xml version=\"1.0\" encoding=\"UTF-8\"?><LegalHold xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Status>string</Status></LegalHold>",
+			value:       `<?xml version="1.0" encoding="UTF-8"?><LegalHold xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>string</Status></LegalHold>`,
 			expectedErr: ErrMalformedXML,
 			expectErr:   true,
 		},
 		{
-			value:       "<?xml version=\"1.0\" encoding=\"UTF-8\"?><LegalHold xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Status>ON</Status></LegalHold>",
+			value:       `<?xml version="1.0" encoding="UTF-8"?><LegalHold xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>ON</Status></LegalHold>`,
 			expectedErr: nil,
 			expectErr:   false,
 		},
 		{
-			value:       "<?xml version=\"1.0\" encoding=\"UTF-8\"?><LegalHold xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Status>On</Status></LegalHold>",
+			value:       `<?xml version="1.0" encoding="UTF-8"?><LegalHold xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>On</Status></LegalHold>`,
 			expectedErr: ErrMalformedXML,
 			expectErr:   true,
 		},

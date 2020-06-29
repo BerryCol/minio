@@ -54,9 +54,10 @@ import (
 
 	"github.com/fatih/color"
 	"github.com/gorilla/mux"
-	"github.com/minio/minio-go/v6/pkg/s3signer"
 	"github.com/minio/minio-go/v6/pkg/s3utils"
+	"github.com/minio/minio-go/v6/pkg/signer"
 	"github.com/minio/minio/cmd/config"
+	"github.com/minio/minio/cmd/crypto"
 	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/pkg/auth"
 	"github.com/minio/minio/pkg/bucket/policy"
@@ -65,8 +66,20 @@ import (
 
 // Tests should initNSLock only once.
 func init() {
+	// disable ENVs which interfere with tests.
+	for _, env := range []string{
+		crypto.EnvAutoEncryptionLegacy,
+		crypto.EnvKMSAutoEncryption,
+		config.EnvAccessKey,
+		config.EnvAccessKeyOld,
+		config.EnvSecretKey,
+		config.EnvSecretKeyOld,
+	} {
+		os.Unsetenv(env)
+	}
+
 	// Set as non-distributed.
-	globalIsDistXL = false
+	globalIsDistErasure = false
 
 	// Disable printing console messages during tests.
 	color.Output = ioutil.Discard
@@ -80,6 +93,8 @@ func init() {
 	logger.Disable = true
 
 	initHelp()
+
+	resetTestGlobals()
 	// Uncomment the following line to see trace logs during unit tests.
 	// logger.AddTarget(console.New())
 }
@@ -96,30 +111,13 @@ const testConcurrencyLevel = 10
 ///      (that are executed by other agents) or when customers pass requests through proxies, which may
 ///      modify the user-agent.
 ///
-///  Content-Length:
-///
-///      This is ignored from signing because generating a pre-signed URL should not provide a content-length
-///      constraint, specifically when vending a S3 pre-signed PUT URL. The corollary to this is that when
-///      sending regular requests (non-pre-signed), the signature contains a checksum of the body, which
-///      implicitly validates the payload length (since changing the number of bytes would change the checksum)
-///      and therefore this header is not valuable in the signature.
-///
-///  Content-Type:
-///
-///      Signing this header causes quite a number of problems in browser environments, where browsers
-///      like to modify and normalize the content-type header in different ways. There is more information
-///      on this in https://github.com/aws/aws-sdk-js/issues/244. Avoiding this field simplifies logic
-///      and reduces the possibility of future bugs
-///
 ///  Authorization:
 ///
 ///      Is skipped for obvious reasons
 ///
 var ignoredHeaders = map[string]bool{
-	"Authorization":  true,
-	"Content-Type":   true,
-	"Content-Length": true,
-	"User-Agent":     true,
+	"Authorization": true,
+	"User-Agent":    true,
 }
 
 // Headers to ignore in streaming v4
@@ -177,42 +175,16 @@ func prepareFS() (ObjectLayer, string, error) {
 	return obj, fsDirs[0], nil
 }
 
-func prepareXLSets32() (ObjectLayer, []string, error) {
-	fsDirs1, err := getRandomDisks(16)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	endpoints1 := mustGetNewEndpoints(fsDirs1...)
-	fsDirs2, err := getRandomDisks(16)
-	if err != nil {
-		removeRoots(fsDirs1)
-		return nil, nil, err
-	}
-	endpoints2 := mustGetNewEndpoints(fsDirs2...)
-
-	endpoints := append(endpoints1, endpoints2...)
-	fsDirs := append(fsDirs1, fsDirs2...)
-	format, err := waitForFormatXL(true, endpoints, 1, 2, 16, "")
-	if err != nil {
-		removeRoots(fsDirs)
-		return nil, nil, err
-	}
-
-	objAPI, err := newXLSets(endpoints, format, 2, 16)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	return objAPI, fsDirs, nil
+func prepareErasureSets32(ctx context.Context) (ObjectLayer, []string, error) {
+	return prepareErasure(ctx, 32)
 }
 
-func prepareXL(nDisks int) (ObjectLayer, []string, error) {
+func prepareErasure(ctx context.Context, nDisks int) (ObjectLayer, []string, error) {
 	fsDirs, err := getRandomDisks(nDisks)
 	if err != nil {
 		return nil, nil, err
 	}
-	obj, _, err := initObjectLayer(mustGetZoneEndpoints(fsDirs...))
+	obj, _, err := initObjectLayer(ctx, mustGetZoneEndpoints(fsDirs...))
 	if err != nil {
 		removeRoots(fsDirs)
 		return nil, nil, err
@@ -220,8 +192,8 @@ func prepareXL(nDisks int) (ObjectLayer, []string, error) {
 	return obj, fsDirs, nil
 }
 
-func prepareXL16() (ObjectLayer, []string, error) {
-	return prepareXL(16)
+func prepareErasure16(ctx context.Context) (ObjectLayer, []string, error) {
+	return prepareErasure(ctx, 16)
 }
 
 // Initialize FS objects.
@@ -235,10 +207,13 @@ func initFSObjects(disk string, t *testing.T) (obj ObjectLayer) {
 	return obj
 }
 
-// TestErrHandler - Golang Testing.T and Testing.B, and gocheck.C satisfy this interface.
+// TestErrHandler - Go testing.T satisfy this interface.
 // This makes it easy to run the TestServer from any of the tests.
-// Using this interface, functionalities to be used in tests can be made generalized, and can be integrated in benchmarks/unit tests/go check suite tests.
+// Using this interface, functionalities to be used in tests can be
+// made generalized, and can be integrated in benchmarks/unit tests/go check suite tests.
 type TestErrHandler interface {
+	Log(args ...interface{})
+	Logf(format string, args ...interface{})
 	Error(args ...interface{})
 	Errorf(format string, args ...interface{})
 	Failed() bool
@@ -250,11 +225,11 @@ const (
 	// FSTestStr is the string which is used as notation for Single node ObjectLayer in the unit tests.
 	FSTestStr string = "FS"
 
-	// XLTestStr is the string which is used as notation for XL ObjectLayer in the unit tests.
-	XLTestStr string = "XL"
+	// ErasureTestStr is the string which is used as notation for Erasure ObjectLayer in the unit tests.
+	ErasureTestStr string = "Erasure"
 
-	// XLSetsTestStr is the string which is used as notation for XL sets object layer in the unit tests.
-	XLSetsTestStr string = "XLSet"
+	// ErasureSetsTestStr is the string which is used as notation for Erasure sets object layer in the unit tests.
+	ErasureSetsTestStr string = "ErasureSet"
 )
 
 const letterBytes = "abcdefghijklmnopqrstuvwxyz01234569"
@@ -300,7 +275,7 @@ func isSameType(obj1, obj2 interface{}) bool {
 
 // TestServer encapsulates an instantiation of a MinIO instance with a temporary backend.
 // Example usage:
-//   s := StartTestServer(t,"XL")
+//   s := StartTestServer(t,"Erasure")
 //   defer s.Stop()
 type TestServer struct {
 	Root      string
@@ -309,16 +284,18 @@ type TestServer struct {
 	SecretKey string
 	Server    *httptest.Server
 	Obj       ObjectLayer
+	cancel    context.CancelFunc
 }
 
-// UnstartedTestServer - Configures a temp FS/XL backend,
+// UnstartedTestServer - Configures a temp FS/Erasure backend,
 // initializes the endpoints and configures the test server.
 // The server should be started using the Start() method.
 func UnstartedTestServer(t TestErrHandler, instanceType string) TestServer {
+	ctx, cancel := context.WithCancel(context.Background())
 	// create an instance of TestServer.
-	testServer := TestServer{}
-	// return FS/XL object layer and temp backend.
-	objLayer, disks, err := prepareTestBackend(instanceType)
+	testServer := TestServer{cancel: cancel}
+	// return FS/Erasure object layer and temp backend.
+	objLayer, disks, err := prepareTestBackend(ctx, instanceType)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -355,27 +332,9 @@ func UnstartedTestServer(t TestErrHandler, instanceType string) TestServer {
 	globalMinioPort = port
 	globalMinioAddr = getEndpointsLocalAddr(testServer.Disks)
 
-	globalConfigSys = NewConfigSys()
+	newAllSubsystems()
 
-	globalIAMSys = NewIAMSys()
-	globalIAMSys.Init(objLayer)
-
-	buckets, err := objLayer.ListBuckets(context.Background())
-	if err != nil {
-		t.Fatalf("Unable to list buckets on backend %s", err)
-	}
-
-	globalPolicySys = NewPolicySys()
-	globalPolicySys.Init(buckets, objLayer)
-
-	globalNotificationSys = NewNotificationSys(testServer.Disks)
-	globalNotificationSys.Init(buckets, objLayer)
-
-	globalLifecycleSys = NewLifecycleSys()
-	globalLifecycleSys.Init(buckets, objLayer)
-
-	globalBucketSSEConfigSys = NewBucketSSEConfigSys()
-	globalBucketSSEConfigSys.Init(buckets, objLayer)
+	initAllSubsystems(ctx, objLayer)
 
 	return testServer
 }
@@ -419,22 +378,6 @@ func resetGlobalConfigPath() {
 	globalConfigDir = &ConfigDir{path: ""}
 }
 
-func resetGlobalServiceDoneCh() {
-	// Repeatedly send on the service done channel, so that
-	// listening go-routines will quit. This works better than
-	// closing the channel - closing introduces a new race, as the
-	// current thread writes to the variable, and other threads
-	// listening on it, read from it.
-loop:
-	for {
-		select {
-		case GlobalServiceDoneCh <- struct{}{}:
-		default:
-			break loop
-		}
-	}
-}
-
 // sets globalObjectAPI to `nil`.
 func resetGlobalObjectAPI() {
 	globalObjLayerMutex.Lock()
@@ -456,8 +399,8 @@ func resetGlobalEndpoints() {
 	globalEndpoints = EndpointZones{}
 }
 
-func resetGlobalIsXL() {
-	globalIsXL = false
+func resetGlobalIsErasure() {
+	globalIsErasure = false
 }
 
 // reset global heal state
@@ -497,9 +440,6 @@ func resetGlobalIAMSys() {
 // Resets all the globals used modified in tests.
 // Resetting ensures that the changes made to globals by one test doesn't affect others.
 func resetTestGlobals() {
-	// close any indefinitely running go-routines from previous
-	// tests.
-	resetGlobalServiceDoneCh()
 	// set globalObjectAPI to `nil`.
 	resetGlobalObjectAPI()
 	// Reset config path set.
@@ -508,8 +448,8 @@ func resetTestGlobals() {
 	resetGlobalConfig()
 	// Reset global endpoints.
 	resetGlobalEndpoints()
-	// Reset global isXL flag.
-	resetGlobalIsXL()
+	// Reset global isErasure flag.
+	resetGlobalIsErasure()
 	// Reset global heal state
 	resetGlobalHealState()
 	// Reset globalIAMSys to `nil`
@@ -539,13 +479,14 @@ func newTestConfig(bucketLocation string, obj ObjectLayer) (err error) {
 
 // Deleting the temporary backend and stopping the server.
 func (testServer TestServer) Stop() {
+	testServer.cancel()
+	testServer.Server.Close()
 	os.RemoveAll(testServer.Root)
 	for _, ep := range testServer.Disks {
 		for _, disk := range ep.Endpoints {
 			os.RemoveAll(disk.Path)
 		}
 	}
-	testServer.Server.Close()
 }
 
 // Truncate request to simulate unexpected EOF for a request signed using streaming signature v4.
@@ -968,7 +909,7 @@ func preSignV2(req *http.Request, accessKeyID, secretAccessKey string, expires i
 
 // Sign given request using Signature V2.
 func signRequestV2(req *http.Request, accessKey, secretKey string) error {
-	s3signer.SignV2(*req, accessKey, secretKey, false)
+	signer.SignV2(*req, accessKey, secretKey, false)
 	return nil
 }
 
@@ -1478,6 +1419,13 @@ func getBucketLocationURL(endPoint, bucketName string) string {
 	return makeTestTargetURL(endPoint, bucketName, "", queryValue)
 }
 
+// return URL For set/get lifecycle of the bucket.
+func getBucketLifecycleURL(endPoint, bucketName string) (ret string) {
+	queryValue := url.Values{}
+	queryValue.Set("lifecycle", "")
+	return makeTestTargetURL(endPoint, bucketName, "", queryValue)
+}
+
 // return URL for listing objects in the bucket with V1 legacy API.
 func getListObjectsV1URL(endPoint, bucketName, prefix, maxKeys, encodingType string) string {
 	queryValue := url.Values{}
@@ -1597,42 +1545,35 @@ func getRandomDisks(N int) ([]string, error) {
 }
 
 // Initialize object layer with the supplied disks, objectLayer is nil upon any error.
-func newTestObjectLayer(endpointZones EndpointZones) (newObject ObjectLayer, err error) {
+func newTestObjectLayer(ctx context.Context, endpointZones EndpointZones) (newObject ObjectLayer, err error) {
 	// For FS only, directly use the disk.
-	if endpointZones.Nodes() == 1 {
+	if endpointZones.NEndpoints() == 1 {
 		// Initialize new FS object layer.
 		return NewFSObjectLayer(endpointZones[0].Endpoints[0].Path)
 	}
 
-	z, err := newXLZones(endpointZones)
+	z, err := newErasureZones(ctx, endpointZones)
 	if err != nil {
 		return nil, err
 	}
 
-	globalConfigSys = NewConfigSys()
+	newAllSubsystems()
 
-	globalIAMSys = NewIAMSys()
-	globalIAMSys.Init(z)
-
-	globalPolicySys = NewPolicySys()
-	globalPolicySys.Init(nil, z)
-
-	globalNotificationSys = NewNotificationSys(endpointZones)
-	globalNotificationSys.Init(nil, z)
+	initAllSubsystems(ctx, z)
 
 	return z, nil
 }
 
 // initObjectLayer - Instantiates object layer and returns it.
-func initObjectLayer(endpointZones EndpointZones) (ObjectLayer, []StorageAPI, error) {
-	objLayer, err := newTestObjectLayer(endpointZones)
+func initObjectLayer(ctx context.Context, endpointZones EndpointZones) (ObjectLayer, []StorageAPI, error) {
+	objLayer, err := newTestObjectLayer(ctx, endpointZones)
 	if err != nil {
 		return nil, nil, err
 	}
 
 	var formattedDisks []StorageAPI
 	// Should use the object layer tests for validating cache.
-	if z, ok := objLayer.(*xlZones); ok {
+	if z, ok := objLayer.(*erasureZones); ok {
 		formattedDisks = z.zones[0].GetDisks(0)()
 	}
 
@@ -1662,16 +1603,20 @@ func removeDiskN(disks []string, n int) {
 // initialies the root and returns its path.
 // return credentials.
 func initAPIHandlerTest(obj ObjectLayer, endpoints []string) (string, http.Handler, error) {
+	newAllSubsystems()
+
+	initAllSubsystems(context.Background(), obj)
+
 	// get random bucket name.
 	bucketName := getRandomBucketName()
 
 	// Create bucket.
-	err := obj.MakeBucketWithLocation(context.Background(), bucketName, "")
+	err := obj.MakeBucketWithLocation(context.Background(), bucketName, BucketOptions{})
 	if err != nil {
 		// failed to create newbucket, return err.
 		return "", nil, err
 	}
-	// Register the API end points with XL object layer.
+	// Register the API end points with Erasure object layer.
 	// Registering only the GetObject handler.
 	apiRouter := initTestAPIEndPoints(obj, endpoints)
 	f := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1682,16 +1627,16 @@ func initAPIHandlerTest(obj ObjectLayer, endpoints []string) (string, http.Handl
 }
 
 // prepare test backend.
-// create FS/XL/XLSet backend.
+// create FS/Erasure/ErasureSet backend.
 // return object layer, backend disks.
-func prepareTestBackend(instanceType string) (ObjectLayer, []string, error) {
+func prepareTestBackend(ctx context.Context, instanceType string) (ObjectLayer, []string, error) {
 	switch instanceType {
-	// Total number of disks for XL sets backend is set to 32.
-	case XLSetsTestStr:
-		return prepareXLSets32()
-	// Total number of disks for XL backend is set to 16.
-	case XLTestStr:
-		return prepareXL16()
+	// Total number of disks for Erasure sets backend is set to 32.
+	case ErasureSetsTestStr:
+		return prepareErasureSets32(ctx)
+	// Total number of disks for Erasure backend is set to 16.
+	case ErasureTestStr:
+		return prepareErasure16(ctx)
 	default:
 		// return FS backend by default.
 		obj, disk, err := prepareFS()
@@ -1711,8 +1656,6 @@ func prepareTestBackend(instanceType string) (ObjectLayer, []string, error) {
 //   policyFunc    - function to return bucketPolicy statement which would permit the anonymous request to be served.
 // The test works in 2 steps, here is the description of the steps.
 //   STEP 1: Call the handler with the unsigned HTTP request (anonReq), assert for the `ErrAccessDenied` error response.
-//   STEP 2: Set the policy to allow the unsigned request, use the policyFunc to obtain the relevant statement and call
-//           the handler again to verify its success.
 func ExecObjectLayerAPIAnonTest(t *testing.T, obj ObjectLayer, testName, bucketName, objectName, instanceType string, apiRouter http.Handler,
 	anonReq *http.Request, bucketPolicy *policy.Policy) {
 
@@ -1737,7 +1680,6 @@ func ExecObjectLayerAPIAnonTest(t *testing.T, obj ObjectLayer, testName, bucketN
 	// creating 2 read closer (to set as request body) from the body content.
 	readerOne := ioutil.NopCloser(bytes.NewBuffer(buf))
 	readerTwo := ioutil.NopCloser(bytes.NewBuffer(buf))
-	readerThree := ioutil.NopCloser(bytes.NewBuffer(buf))
 
 	anonReq.Body = readerOne
 
@@ -1745,9 +1687,9 @@ func ExecObjectLayerAPIAnonTest(t *testing.T, obj ObjectLayer, testName, bucketN
 	apiRouter.ServeHTTP(rec, anonReq)
 
 	// expected error response when the unsigned HTTP request is not permitted.
-	accesDeniedHTTPStatus := getAPIError(ErrAccessDenied).HTTPStatusCode
-	if rec.Code != accesDeniedHTTPStatus {
-		t.Fatal(failTestStr(anonTestStr, fmt.Sprintf("Object API Nil Test expected to fail with %d, but failed with %d", accesDeniedHTTPStatus, rec.Code)))
+	accessDenied := getAPIError(ErrAccessDenied).HTTPStatusCode
+	if rec.Code != accessDenied {
+		t.Fatal(failTestStr(anonTestStr, fmt.Sprintf("Object API Nil Test expected to fail with %d, but failed with %d", accessDenied, rec.Code)))
 	}
 
 	// HEAD HTTTP request doesn't contain response body.
@@ -1773,39 +1715,8 @@ func ExecObjectLayerAPIAnonTest(t *testing.T, obj ObjectLayer, testName, bucketN
 		}
 	}
 
-	if err := obj.SetBucketPolicy(context.Background(), bucketName, bucketPolicy); err != nil {
-		t.Fatalf("unexpected error. %v", err)
-	}
-	globalPolicySys.Set(bucketName, *bucketPolicy)
-	defer globalPolicySys.Remove(bucketName)
-
-	// now call the handler again with the unsigned/anonymous request, it should be accepted.
-	rec = httptest.NewRecorder()
-
-	anonReq.Body = readerTwo
-
-	apiRouter.ServeHTTP(rec, anonReq)
-
-	var expectedHTTPStatus int
-	// expectedHTTPStatus returns 204 (http.StatusNoContent) on success.
-	if testName == "TestAPIDeleteObjectHandler" || testName == "TestAPIAbortMultipartHandler" {
-		expectedHTTPStatus = http.StatusNoContent
-	} else if strings.Contains(testName, "BucketPolicyHandler") || testName == "ListBucketsHandler" {
-		// BucketPolicyHandlers and `ListBucketsHandler` doesn't support anonymous request, policy changes should allow unsigned requests.
-		expectedHTTPStatus = http.StatusForbidden
-	} else {
-		// other API handlers return 200OK on success.
-		expectedHTTPStatus = http.StatusOK
-	}
-
-	// compare the HTTP response status code with the expected one.
-	if rec.Code != expectedHTTPStatus {
-		t.Fatal(failTestStr(anonTestStr, fmt.Sprintf("Expected the anonymous HTTP request to be served after the policy changes\n,Expected response HTTP status code to be %d, got %d",
-			expectedHTTPStatus, rec.Code)))
-	}
-
 	// test for unknown auth case.
-	anonReq.Body = readerThree
+	anonReq.Body = readerTwo
 	// Setting the `Authorization` header to a random value so that the signature falls into unknown auth case.
 	anonReq.Header.Set("Authorization", "nothingElse")
 	// initialize new response recorder.
@@ -1834,8 +1745,10 @@ func ExecObjectLayerAPIAnonTest(t *testing.T, obj ObjectLayer, testName, bucketN
 		}
 	}
 
-	if rec.Code != accesDeniedHTTPStatus {
-		t.Fatal(failTestStr(unknownSignTestStr, fmt.Sprintf("Object API Unknow auth test for \"%s\", expected to fail with %d, but failed with %d", testName, accesDeniedHTTPStatus, rec.Code)))
+	// expected error response when the unsigned HTTP request is not permitted.
+	unsupportedSignature := getAPIError(ErrSignatureVersionNotSupported).HTTPStatusCode
+	if rec.Code != unsupportedSignature {
+		t.Fatal(failTestStr(unknownSignTestStr, fmt.Sprintf("Object API Unknow auth test for \"%s\", expected to fail with %d, but failed with %d", testName, unsupportedSignature, rec.Code)))
 	}
 
 }
@@ -1891,8 +1804,11 @@ func ExecObjectLayerAPINilTest(t TestErrHandler, bucketName, objectName, instanc
 }
 
 // ExecObjectLayerAPITest - executes object layer API tests.
-// Creates single node and XL ObjectLayer instance, registers the specified API end points and runs test for both the layers.
+// Creates single node and Erasure ObjectLayer instance, registers the specified API end points and runs test for both the layers.
 func ExecObjectLayerAPITest(t *testing.T, objAPITest objAPITestType, endpoints []string) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	// reset globals.
 	// this is to make sure that the tests are not affected by modified value.
 	resetTestGlobals()
@@ -1901,6 +1817,7 @@ func ExecObjectLayerAPITest(t *testing.T, objAPITest objAPITestType, endpoints [
 	if err != nil {
 		t.Fatalf("Initialization of object layer failed for single node setup: %s", err)
 	}
+
 	bucketFS, fsAPIRouter, err := initAPIHandlerTest(objLayer, endpoints)
 	if err != nil {
 		t.Fatalf("Initialization of API handler tests failed: <ERROR> %s", err)
@@ -1912,34 +1829,25 @@ func ExecObjectLayerAPITest(t *testing.T, objAPITest objAPITestType, endpoints [
 		t.Fatalf("Unable to initialize server config. %s", err)
 	}
 
-	newAllSubsystems()
-
-	globalIAMSys.Init(objLayer)
-
-	buckets, err := objLayer.ListBuckets(context.Background())
-	if err != nil {
-		t.Fatalf("Unable to list buckets on backend %s", err)
-	}
-
-	globalPolicySys.Init(buckets, objLayer)
-
 	credentials := globalActiveCred
 
 	// Executing the object layer tests for single node setup.
 	objAPITest(objLayer, FSTestStr, bucketFS, fsAPIRouter, credentials, t)
 
-	objLayer, xlDisks, err := prepareXL16()
+	objLayer, erasureDisks, err := prepareErasure16(ctx)
 	if err != nil {
-		t.Fatalf("Initialization of object layer failed for XL setup: %s", err)
+		t.Fatalf("Initialization of object layer failed for Erasure setup: %s", err)
 	}
-	bucketXL, xlAPIRouter, err := initAPIHandlerTest(objLayer, endpoints)
+
+	bucketErasure, erAPIRouter, err := initAPIHandlerTest(objLayer, endpoints)
 	if err != nil {
 		t.Fatalf("Initialzation of API handler tests failed: <ERROR> %s", err)
 	}
-	// Executing the object layer tests for XL.
-	objAPITest(objLayer, XLTestStr, bucketXL, xlAPIRouter, credentials, t)
+	// Executing the object layer tests for Erasure.
+	objAPITest(objLayer, ErasureTestStr, bucketErasure, erAPIRouter, credentials, t)
+
 	// clean up the temporary test backend.
-	removeRoots(append(xlDisks, fsDir))
+	removeRoots(append(erasureDisks, fsDir))
 }
 
 // function to be passed to ExecObjectLayerAPITest, for executing object layr API handler tests.
@@ -1956,51 +1864,52 @@ type objTestTypeWithDirs func(obj ObjectLayer, instanceType string, dirs []strin
 type objTestDiskNotFoundType func(obj ObjectLayer, instanceType string, dirs []string, t *testing.T)
 
 // ExecObjectLayerTest - executes object layer tests.
-// Creates single node and XL ObjectLayer instance and runs test for both the layers.
+// Creates single node and Erasure ObjectLayer instance and runs test for both the layers.
 func ExecObjectLayerTest(t TestErrHandler, objTest objTestType) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	objLayer, fsDir, err := prepareFS()
 	if err != nil {
 		t.Fatalf("Initialization of object layer failed for single node setup: %s", err)
 	}
 
+	newAllSubsystems()
+
 	// initialize the server and obtain the credentials and root.
 	// credentials are necessary to sign the HTTP request.
 	if err = newTestConfig(globalMinioDefaultRegion, objLayer); err != nil {
 		t.Fatal("Unexpected error", err)
 	}
 
-	globalIAMSys = NewIAMSys()
-	globalIAMSys.Init(objLayer)
-
-	buckets, err := objLayer.ListBuckets(context.Background())
-	if err != nil {
-		t.Fatalf("Unable to list buckets on backend %s", err)
-	}
-
-	globalPolicySys = NewPolicySys()
-	globalPolicySys.Init(buckets, objLayer)
-
-	globalBucketSSEConfigSys = NewBucketSSEConfigSys()
-	globalBucketSSEConfigSys.Init(buckets, objLayer)
+	initAllSubsystems(ctx, objLayer)
 
 	// Executing the object layer tests for single node setup.
 	objTest(objLayer, FSTestStr, t)
 
-	objLayer, fsDirs, err := prepareXLSets32()
+	newAllSubsystems()
+
+	objLayer, fsDirs, err := prepareErasureSets32(ctx)
 	if err != nil {
-		t.Fatalf("Initialization of object layer failed for XL setup: %s", err)
+		t.Fatalf("Initialization of object layer failed for Erasure setup: %s", err)
 	}
-	// Executing the object layer tests for XL.
-	objTest(objLayer, XLTestStr, t)
+
+	initAllSubsystems(ctx, objLayer)
+
 	defer removeRoots(append(fsDirs, fsDir))
+	// Executing the object layer tests for Erasure.
+	objTest(objLayer, ErasureTestStr, t)
 }
 
 // ExecObjectLayerTestWithDirs - executes object layer tests.
-// Creates single node and XL ObjectLayer instance and runs test for both the layers.
+// Creates single node and Erasure ObjectLayer instance and runs test for both the layers.
 func ExecObjectLayerTestWithDirs(t TestErrHandler, objTest objTestTypeWithDirs) {
-	objLayer, fsDirs, err := prepareXL16()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	objLayer, fsDirs, err := prepareErasure16(ctx)
 	if err != nil {
-		t.Fatalf("Initialization of object layer failed for XL setup: %s", err)
+		t.Fatalf("Initialization of object layer failed for Erasure setup: %s", err)
 	}
 
 	// initialize the server and obtain the credentials and root.
@@ -2009,25 +1918,28 @@ func ExecObjectLayerTestWithDirs(t TestErrHandler, objTest objTestTypeWithDirs) 
 		t.Fatal("Unexpected error", err)
 	}
 
-	// Executing the object layer tests for XL.
-	objTest(objLayer, XLTestStr, fsDirs, t)
+	// Executing the object layer tests for Erasure.
+	objTest(objLayer, ErasureTestStr, fsDirs, t)
 	defer removeRoots(fsDirs)
 }
 
 // ExecObjectLayerDiskAlteredTest - executes object layer tests while altering
-// disks in between tests. Creates XL ObjectLayer instance and runs test for XL layer.
+// disks in between tests. Creates Erasure ObjectLayer instance and runs test for Erasure layer.
 func ExecObjectLayerDiskAlteredTest(t *testing.T, objTest objTestDiskNotFoundType) {
-	objLayer, fsDirs, err := prepareXL16()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	objLayer, fsDirs, err := prepareErasure16(ctx)
 	if err != nil {
-		t.Fatalf("Initialization of object layer failed for XL setup: %s", err)
+		t.Fatalf("Initialization of object layer failed for Erasure setup: %s", err)
 	}
 
 	if err = newTestConfig(globalMinioDefaultRegion, objLayer); err != nil {
 		t.Fatal("Failed to create config directory", err)
 	}
 
-	// Executing the object layer tests for XL.
-	objTest(objLayer, XLTestStr, fsDirs, t)
+	// Executing the object layer tests for Erasure.
+	objTest(objLayer, ErasureTestStr, fsDirs, t)
 	defer removeRoots(fsDirs)
 }
 
@@ -2035,23 +1947,26 @@ func ExecObjectLayerDiskAlteredTest(t *testing.T, objTest objTestDiskNotFoundTyp
 type objTestStaleFilesType func(obj ObjectLayer, instanceType string, dirs []string, t *testing.T)
 
 // ExecObjectLayerStaleFilesTest - executes object layer tests those leaves stale
-// files/directories under .minio/tmp.  Creates XL ObjectLayer instance and runs test for XL layer.
+// files/directories under .minio/tmp.  Creates Erasure ObjectLayer instance and runs test for Erasure layer.
 func ExecObjectLayerStaleFilesTest(t *testing.T, objTest objTestStaleFilesType) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	nDisks := 16
 	erasureDisks, err := getRandomDisks(nDisks)
 	if err != nil {
-		t.Fatalf("Initialization of disks for XL setup: %s", err)
+		t.Fatalf("Initialization of disks for Erasure setup: %s", err)
 	}
-	objLayer, _, err := initObjectLayer(mustGetZoneEndpoints(erasureDisks...))
+	objLayer, _, err := initObjectLayer(ctx, mustGetZoneEndpoints(erasureDisks...))
 	if err != nil {
-		t.Fatalf("Initialization of object layer failed for XL setup: %s", err)
+		t.Fatalf("Initialization of object layer failed for Erasure setup: %s", err)
 	}
 	if err = newTestConfig(globalMinioDefaultRegion, objLayer); err != nil {
 		t.Fatal("Failed to create config directory", err)
 	}
 
-	// Executing the object layer tests for XL.
-	objTest(objLayer, XLTestStr, erasureDisks, t)
+	// Executing the object layer tests for Erasure.
+	objTest(objLayer, ErasureTestStr, erasureDisks, t)
 	defer removeRoots(erasureDisks)
 }
 
@@ -2085,6 +2000,12 @@ func registerBucketLevelFunc(bucket *mux.Router, api objectAPIHandlers, apiFunct
 		case "GetBucketPolicy":
 			// Register Get Bucket policy HTTP Handler.
 			bucket.Methods("GET").HandlerFunc(api.GetBucketPolicyHandler).Queries("policy", "")
+		case "GetBucketLifecycle":
+			bucket.Methods("GET").HandlerFunc(api.GetBucketLifecycleHandler).Queries("lifecycle", "")
+		case "PutBucketLifecycle":
+			bucket.Methods("PUT").HandlerFunc(api.PutBucketLifecycleHandler).Queries("lifecycle", "")
+		case "DeleteBucketLifecycle":
+			bucket.Methods("DELETE").HandlerFunc(api.DeleteBucketLifecycleHandler).Queries("lifecycle", "")
 		case "GetBucketLocation":
 			// Register GetBucketLocation handler.
 			bucket.Methods("GET").HandlerFunc(api.GetBucketLocationHandler).Queries("location", "")
@@ -2171,7 +2092,7 @@ func registerAPIFunctions(muxRouter *mux.Router, objLayer ObjectLayer, apiFuncti
 	registerBucketLevelFunc(bucketRouter, api, apiFunctions...)
 }
 
-// Takes in XL object layer, and the list of API end points to be tested/required, registers the API end points and returns the HTTP handler.
+// Takes in Erasure object layer, and the list of API end points to be tested/required, registers the API end points and returns the HTTP handler.
 // Need isolated registration of API end points while writing unit tests for end points.
 // All the API end points are registered only for the default case.
 func initTestAPIEndPoints(objLayer ObjectLayer, apiFunctions []string) http.Handler {
@@ -2431,11 +2352,16 @@ func uploadTestObject(t *testing.T, apiRouter http.Handler, creds auth.Credentia
 			rec = httptest.NewRecorder()
 			apiRouter.ServeHTTP(rec, req)
 			checkRespErr(rec, http.StatusOK)
-			etag := rec.Header()["ETag"][0]
-			if etag == "" {
-				t.Fatalf("Unexpected empty etag")
+			header := rec.Header()
+			if v, ok := header["ETag"]; ok {
+				etag := v[0]
+				if etag == "" {
+					t.Fatalf("Unexpected empty etag")
+				}
+				cp = append(cp, CompletePart{partID, etag[1 : len(etag)-1]})
+			} else {
+				t.Fatalf("Missing etag header")
 			}
-			cp = append(cp, CompletePart{partID, etag[1 : len(etag)-1]})
 		}
 
 		// Call CompleteMultipart API
